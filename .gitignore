@@ -1,5 +1,6 @@
 # Outputs and local state
 logs/
+state/
 *.log
 models/
 *.layers/

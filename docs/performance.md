@@ -5,6 +5,11 @@ DP2/TP8、Model Runner V2、DSpark K=5、FULL_DECODE_ONLY、1M 上下文上限�
 `--max-num-batched-tokens 16384`、6 个优化 gate、
 `HCCL_OP_EXPANSION_MODE=AIV`、jemalloc、external LB + prefix router。
 
+> **默认上下文已改为 360448**（`DSV41_MAX_MODEL_LEN`）。本文所有吞吐与显存/KV
+> 数据都是在 `--max-model-len 1048576` 下实测的；360448 下 KV 预算更宽松（可容纳更多
+> 并发长请求），但**没有重新采集**，换算前请以启动日志里的
+> `Free memory on device` / KV cache 行为准。
+
 > **数据批次**：下面的 2K/8K 表在 2026-11-02 用生产 **16384** 批次、
 > external LB + prefix router 重新采集，测试期间机器无其它在线流量。
 > 2K 分两组：单前缀（热前缀，`bench_2k.py`）和双前缀 A/B（`bench_dual.py`，
@@ -135,12 +140,13 @@ python3 scripts/bench_dual.py --prompt-repeat 11 --max-tokens 1024 \
 
 ### 上下文长度
 
-`--max-model-len` 直接决定 KV cache 上限。当前 1M + 16384 批次时每 die
-KV ≈6.7 GiB（1,268,538 tokens/DP rank）；8192 批次时约 9.7 GiB
-（2,091,049 tokens/DP rank）。缩短上下文可以换取更多并发余量，但会进入编译
+`--max-model-len` 直接决定 KV cache 上限。**默认 360448**；下面的容量数字是在 1M
++ 16384 批次下的实测值：每 die KV ≈6.7 GiB（1,268,538 tokens/DP rank）；8192 批次时
+约 9.7 GiB（2,091,049 tokens/DP rank）。缩短上下文可以换取更多并发余量，但会进入编译
 缓存 key（改了就冷启动）：
 
 ```bash
+DSV41_MAX_MODEL_LEN=1048576 bash scripts/serve.sh   # 回到 1M
 DSV41_MAX_MODEL_LEN=262144 bash scripts/serve.sh
 ```
 

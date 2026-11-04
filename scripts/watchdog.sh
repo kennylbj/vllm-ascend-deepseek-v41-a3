@@ -96,6 +96,14 @@ start_service() {
     return 0
   fi
   dsv41_cleanup_residual
+  # Container runtime: make sure the container is up (idempotent; also
+  # re-applies patches) before serve.sh hands over to it.
+  if [ "$DSV41_RUNTIME" = "docker" ]; then
+    if ! bash "$SELF_DIR/container.sh" up >> "$LOG_FILE" 2>&1; then
+      log "容器未就绪 (container.sh up 失败)，见 $LOG_FILE"
+      return 1
+    fi
+  fi
   log "启动服务: bash $SERVE_SCRIPT (端口 $DSV41_PORT)"
   nohup bash "$SERVE_SCRIPT" >> "$LOG_FILE" 2>&1 &
 

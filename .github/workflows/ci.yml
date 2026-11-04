@@ -31,6 +31,15 @@ jobs:
       - name: Python compile
         run: python3 -m py_compile scripts/*.py tests/*.py examples/*.py
 
+      - name: Python 3.7 syntax (air-gapped host helper scripts)
+        run: |
+          python3 - <<'PY'
+          import ast, glob
+          for f in glob.glob("scripts/*.py") + glob.glob("tests/*.py") + glob.glob("examples/*.py"):
+              ast.parse(open(f, encoding="utf-8").read(), f, feature_version=(3, 7))
+          print("py3.7 syntax ok")
+          PY
+
       - name: Install test dependencies
         run: pip install -r requirements.txt
 

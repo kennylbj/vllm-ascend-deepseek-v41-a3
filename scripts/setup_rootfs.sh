@@ -24,6 +24,12 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 . "$SELF_DIR/common.sh"
 
+if [ "$DSV41_RUNTIME" = "docker" ]; then
+  echo "[rootfs] DSV41_RUNTIME=docker：服务运行在本机已加载的镜像 $DSV41_IMAGE 内，无需下载/解包 rootfs。"
+  echo "[rootfs] 下一步: bash scripts/container.sh up"
+  exit 0
+fi
+
 REGISTRY=${REGISTRY:-quay.nju.edu.cn}
 REPO=${REPO:-ascend/vllm-ascend}
 TAG=${TAG:-v0.30.0rc2-a3}

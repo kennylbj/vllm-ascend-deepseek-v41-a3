@@ -3,6 +3,38 @@
 All notable changes to this deployment project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-11-03
+
+### Added
+
+- **Docker runtime** (`DSV41_RUNTIME=docker`, default stays `native`) for air-gapped
+  nodes and hosts whose glibc is older than the image's (e.g. Kylin V10, glibc
+  2.28): `scripts/container.sh` creates a long-lived `--privileged --net=host
+  --ipc=host --pid=host` container from the locally loaded image, mounts the host
+  Ascend driver, the model (same path) and state dirs. `serve.sh` and
+  `apply_patches.sh` re-execute themselves inside it; watchdog / kill_vllm /
+  doctor stay on the host (shared PID namespace).
+- `config/dsv41.docker.env.example`, `systemd/dsv41-container.service`,
+  `docs/offline-deployment.md`, `make container-*` / `make probe`.
+- `DSV41_PROBE=1 bash scripts/serve.sh` and `doctor.sh --probe`: import
+  torch_npu / vllm_ascend with the serving environment and count NPUs.
+- Offline defaults in `serve.sh` (`DSV41_OFFLINE=1`: `HF_HUB_OFFLINE`,
+  `TRANSFORMERS_OFFLINE`, `VLLM_NO_USAGE_STATS`, …).
+- `--enable-prompt-tokens-details` (`DSV41_ENABLE_PROMPT_TOKENS_DETAILS=1`).
+- `tests/test_container.py`; a Python 3.7 syntax check in `make lint` and CI.
+
+### Changed
+
+- **Default `--max-model-len` is now 360448** (was 1048576; 2816 × 128, aligned to
+  the 128-token block size). Capacity numbers in
+  the docs were measured at 1M and are labelled as such.
+- **Cleanup is scoped to this deployment.** `serve.sh` tags every process it
+  launches (`DSV41_PROC_TAG`); watchdog restarts, `STOP=1` and `kill_vllm.sh`
+  only touch tagged processes / the serve process tree, never other vLLM or NPU
+  jobs on the node. `DSV41_CLEAN_ALL_VLLM` now defaults to `0` and
+  `kill_vllm.sh --all` restores the old machine-wide behaviour.
+- `serve.sh` no longer builds `//usr/local/...` paths when `DSV41_ROOTFS=/`.
+
 ## [0.1.1] — 2026-11-01
 
 ### Fixed

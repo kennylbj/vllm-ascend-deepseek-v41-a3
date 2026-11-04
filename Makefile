@@ -1,12 +1,21 @@
 SHELL := /bin/bash
 ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart smoke bench bench8 test lint clean
+.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart smoke bench bench8 test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
 
 help:
 	@echo "vllm-ascend-deepseek-v41-a3"
 	@echo
-	@echo "  make setup           解包 rootfs（下载 OCI 镜像层）"
+	@echo "  --- DSV41_RUNTIME=docker（离线 / 旧 glibc 宿主，见 docs/offline-deployment.md）---"
+	@echo "  make container-up    创建/启动容器并应用补丁（幂等）"
+	@echo "  make container-status 容器状态"
+	@echo "  make container-shell 进入容器"
+	@echo "  make container-down  停止容器（容器内 vLLM 随之终止）"
+	@echo "  make container-recreate 删除并重建容器（改了挂载/参数后）"
+	@echo "  make container-cmd   只打印 docker run 命令"
+	@echo "  make probe           用服务环境 import torch_npu / vllm_ascend 并统计 NPU 数"
+	@echo
+	@echo "  make setup           解包 rootfs（下载 OCI 镜像层；docker 运行时无需）"
 	@echo "  make patches         应用优化补丁（幂等）"
 	@echo "  make verify          校验补丁与 6 个 gate"
 	@echo "  make serve           启动服务（后台）"
@@ -26,6 +35,27 @@ help:
 
 doctor:
 	bash $(ROOT)/scripts/doctor.sh
+
+container-up:
+	bash $(ROOT)/scripts/container.sh up
+
+container-down:
+	bash $(ROOT)/scripts/container.sh down
+
+container-status:
+	bash $(ROOT)/scripts/container.sh status
+
+container-shell:
+	bash $(ROOT)/scripts/container.sh shell
+
+container-recreate:
+	bash $(ROOT)/scripts/container.sh recreate
+
+container-cmd:
+	bash $(ROOT)/scripts/container.sh print-cmd
+
+probe:
+	DSV41_PROBE=1 bash $(ROOT)/scripts/serve.sh
 
 setup:
 	bash $(ROOT)/scripts/setup_rootfs.sh
@@ -75,6 +105,8 @@ test:
 lint:
 	@for f in $(ROOT)/scripts/*.sh $(ROOT)/examples/*.sh; do bash -n "$$f" || exit 1; done
 	@python3 -m py_compile $(ROOT)/scripts/*.py $(ROOT)/tests/*.py $(ROOT)/examples/*.py
+	@# The air-gapped host only has Python 3.7: helper scripts must still parse there.
+	@python3 -c "import ast,glob,sys; [ast.parse(open(f,encoding='utf-8').read(), f, feature_version=(3,7)) for f in glob.glob('$(ROOT)/scripts/*.py')+glob.glob('$(ROOT)/tests/*.py')+glob.glob('$(ROOT)/examples/*.py')]; print('py3.7 syntax ok')"
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck -S warning $(ROOT)/scripts/*.sh $(ROOT)/examples/*.sh || true
 	@echo "lint ok"
 

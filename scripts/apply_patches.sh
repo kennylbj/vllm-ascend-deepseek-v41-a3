@@ -26,7 +26,11 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 . "$SELF_DIR/common.sh"
 
-SRC=${SRC:-$DSV41_ROOTFS/vllm-workspace/vllm-ascend}
+# The patched sources live inside the image: with DSV41_RUNTIME=docker run
+# everything in the container (no-op on the native runtime / inside the container).
+dsv41_reexec_in_container "$SELF_DIR/apply_patches.sh" "$@"
+
+SRC=${SRC:-${DSV41_ROOTFS%/}/vllm-workspace/vllm-ascend}
 PATCH_DIR=${PATCH_DIR:-$SELF_DIR/patches/vllm-ascend-v41-rc2}
 SERIES="$PATCH_DIR/series.conf"
 MARKER_DIR="$SRC/.patches-applied.d"

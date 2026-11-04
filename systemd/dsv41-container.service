@@ -1,0 +1,28 @@
+[Unit]
+Description=DeepSeek-V4.1-Flash-1017 w8a8 (vLLM Ascend A3, container runtime + watchdog)
+Documentation=file:///opt/vllm-ascend-deepseek-v41-a3/docs/offline-deployment.md
+# No network-online.target: this unit is meant for air-gapped nodes.
+After=docker.service
+Requires=docker.service
+
+[Service]
+# Brings the container up (idempotent, re-applies patches) and starts the
+# watchdog, which then (re)starts vLLM inside the container and keeps it healthy.
+# Stopping the unit stops only the watchdog: the container and the model keep
+# running. Use `bash scripts/kill_vllm.sh` / `container.sh down` to stop those.
+Type=oneshot
+RemainAfterExit=yes
+User=root
+WorkingDirectory=/opt/vllm-ascend-deepseek-v41-a3
+EnvironmentFile=-/etc/dsv41.env
+RuntimeDirectory=dsv41
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0755
+ExecStartPre=/bin/bash /opt/vllm-ascend-deepseek-v41-a3/scripts/container.sh up
+ExecStart=/bin/bash /opt/vllm-ascend-deepseek-v41-a3/scripts/watchdog.sh start
+ExecStop=/bin/bash /opt/vllm-ascend-deepseek-v41-a3/scripts/watchdog.sh stop
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,10 @@
 本文从一台空白的 8×Ascend 910C（A3）节点开始，完成 rootfs 解包、权重准备、
 补丁应用、服务启动、验证与托管。每一步都给出**可观察的判定点**，便于定位失败环节。
 
+> 本文是 **rootfs 直跑**（`DSV41_RUNTIME=native`）流程，要求宿主 glibc ≥ 2.35 且能访问
+> registry。**离线服务器或宿主 glibc 较旧（如 Kylin V10 的 2.28）请看
+> [`offline-deployment.md`](offline-deployment.md)**（docker 运行时，使用本机已加载的镜像）。
+
 ---
 
 ## 0. 前置条件
@@ -23,8 +27,9 @@ npu-smi info | grep -E "VLLMWorker|/ 65536"
 bash scripts/kill_vllm.sh --dry-run     # 只列出会处理哪些进程
 ```
 
-> 若节点上还有其它模型服务，必须设置 `DSV41_CLEAN_ALL_VLLM=0`，否则清理逻辑会
-> 终止本机所有 `VLLM::` worker。
+> 清理逻辑默认只处理本部署的进程（`DSV41_CLEAN_ALL_VLLM=0`，serve.sh 启动的进程带
+> `DSV41_PROC_TAG`），不会误杀同机其它模型服务；只有显式设置 `DSV41_CLEAN_ALL_VLLM=1`
+> 或 `kill_vllm.sh --all` 才会终止本机所有 `VLLM::` worker。
 
 ---
 
@@ -173,7 +178,8 @@ API key、磁盘与代理环境。失败项会给出对应修复入口；建议�
 | `--data-parallel-size` | 2 | 16 die = DP2 × TP8 |
 | `--tensor-parallel-size` | 8 | 每 DP rank 8 die |
 | `--enable-expert-parallel` | on | 384 routed experts 分布在 16 die |
-| `--max-model-len` | 1048576 | 1M 上下文；16384 批次下 KV cache 约 6.7 GiB/die |
+| `--max-model-len` | 360448（`DSV41_MAX_MODEL_LEN`，= 2816 × 128） | 默认上下文；1048576（1M）在 16384 批次下 KV cache 约 6.7 GiB/die（实测） |
+| `--enable-prompt-tokens-details` | on | `usage.prompt_tokens_details.cached_tokens`（`DSV41_ENABLE_PROMPT_TOKENS_DETAILS=0` 关闭） |
 | `--max-num-seqs` | 32 | 与图捕获桶上限对齐 |
 | `--max-num-batched-tokens` | 16384 | prefill 批大小；激活峰值约 8.2 GiB，32768 放不进 1M 上下文预算 |
 | `--data-parallel-multi-port-external-lb` | on | external 模式：supervisor 8020 + rank 8022/8023 |

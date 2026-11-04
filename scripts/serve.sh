@@ -3,19 +3,22 @@
 # serve.sh — start / stop / inspect the DeepSeek-V4.1-Flash-1017-w8a8 server
 #
 # Production configuration baked in:
-#   * vLLM Ascend v0.30.0rc2 (native rootfs, no docker)
+#   * vLLM Ascend v0.30.0rc2 (DSV41_RUNTIME=native rootfs, or =docker container)
 #   * DP2 / TP8 on one 8-card A3 node (16 dies), expert parallel
 #   * Model Runner V2 + DSpark speculative decoding (K=5)
 #   * FULL_DECODE_ONLY ACL graph with 6N-sized buckets
-#   * 1M context, prefix caching, engram CPU offload / DP shared memory
+#   * 360448-token context (DSV41_MAX_MODEL_LEN), prefix caching,
+#     engram CPU offload / DP shared memory, prompt_tokens_details in usage
 #   * optional Bearer-token authentication (--api-key)
 #
 # Usage:
 #   bash scripts/serve.sh                 # start in background
 #   bash scripts/serve.sh run             # start in foreground (debug)
-#   STOP=1 bash scripts/serve.sh          # stop (including residual workers)
+#   STOP=1 bash scripts/serve.sh          # stop this deployment (never other NPU jobs)
 #   STATUS=1 bash scripts/serve.sh        # show status / readiness
 #
+# With DSV41_RUNTIME=docker the start path re-executes itself inside the
+# container (scripts/container.sh); STOP/STATUS always run on the host.
 # Prefer scripts/watchdog.sh for unattended operation.
 # =============================================================================
 set -Eeuo pipefail
@@ -25,7 +28,7 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$SELF_DIR/common.sh"
 
 # ---- tunables (override via environment or config/*.env) --------------------
-: "${DSV41_MAX_MODEL_LEN:=1048576}"
+: "${DSV41_MAX_MODEL_LEN:=360448}"                # 2816 x 128 (block-aligned)
 : "${DSV41_MAX_NUM_BATCHED_TOKENS:=8192}"
 : "${DSV41_MAX_NUM_SEQS:=32}"
 : "${DSV41_GPU_MEM_UTIL:=0.9}"
@@ -34,6 +37,8 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${DSV41_USE_V2:=1}"
 : "${DSV41_ENABLE_PREFIX_CACHING:=1}"
 : "${DSV41_ENABLE_EXPERT_PARALLEL:=1}"
+: "${DSV41_ENABLE_PROMPT_TOKENS_DETAILS:=1}"    # usage.prompt_tokens_details.cached_tokens
+: "${DSV41_OFFLINE:=1}"                         # never reach out to model hubs / usage-stat servers
 : "${DSV41_SAFETENSORS_LOAD_STRATEGY:=lazy}"
 : "${DSV41_LOADER_THREADS:=128}"
 : "${DSV41_ENGINE_READY_TIMEOUT_S:=36000}"
@@ -128,12 +133,20 @@ if [ "${STATUS:-0}" = "1" ]; then
   exit 0
 fi
 
+# ---- container runtime hand-off ----------------------------------------------
+# Everything below needs the image's Python / CANN, so with DSV41_RUNTIME=docker
+# it runs inside the container (no-op on the native runtime or when already inside).
+dsv41_reexec_in_container "$SELF_DIR/serve.sh" "$@"
+
 # ---- preflight -------------------------------------------------------------
 dsv41_unset_proxy
 mkdir -p "$DSV41_RESULTS" "$DSV41_PID_DIR"
 
-PYTHON_HOME_DIR=${DSV41_PYTHONHOME:-$(find "$DSV41_ROOTFS/usr/local" -maxdepth 1 -type d -name 'python3.12*' 2>/dev/null | sort -V | tail -1)}
-CANN=${DSV41_CANN_HOME:-$(find "$DSV41_ROOTFS/usr/local/Ascend" -maxdepth 1 -type d -name 'cann-*' 2>/dev/null | sort -V | tail -1)}
+# DSV41_ROOTFS=/ (container runtime) must not produce "//usr/local/..." paths.
+RFS=${DSV41_ROOTFS%/}
+
+PYTHON_HOME_DIR=${DSV41_PYTHONHOME:-$(find "$RFS/usr/local" -maxdepth 1 -type d -name 'python3.12*' 2>/dev/null | sort -V | tail -1)}
+CANN=${DSV41_CANN_HOME:-$(find "$RFS/usr/local/Ascend" -maxdepth 1 -type d -name 'cann-*' 2>/dev/null | sort -V | tail -1)}
 PY="$PYTHON_HOME_DIR/bin/python3.12"
 
 if [ -z "$PYTHON_HOME_DIR" ] || [ ! -x "$PY" ]; then
@@ -153,7 +166,8 @@ if [ ! -f "$DSV41_MODEL/config.json" ]; then
 fi
 
 # Refuse to silently start a second instance on the same node.
-if [ "${DSV41_ALLOW_MULTI:-0}" != "1" ] && [ "${ROUTER_RESTART:-0}" != "1" ]; then
+# (DSV41_PROBE=1 only imports the stack and exits, so it may run next to a live server.)
+if [ "${DSV41_ALLOW_MULTI:-0}" != "1" ] && [ "${ROUTER_RESTART:-0}" != "1" ] && [ "${DSV41_PROBE:-0}" != "1" ]; then
   existing=$(dsv41_find_serve_pid || true)
   if [ -n "$existing" ]; then
     echo "[serve] ❌ 端口 $DSV41_PORT 上已有 vLLM 实例 (pid=$existing)" >&2
@@ -173,7 +187,7 @@ if [ "${DSV41_ALLOW_MULTI:-0}" != "1" ] && [ "${ROUTER_RESTART:-0}" != "1" ]; th
   fi
 fi
 
-if [ "${DSV41_ALLOW_MULTI:-0}" != "1" ] && [ "${ROUTER_RESTART:-0}" != "1" ] && [ "$DSV41_LB_MODE" = "external" ]; then
+if [ "${DSV41_ALLOW_MULTI:-0}" != "1" ] && [ "${ROUTER_RESTART:-0}" != "1" ] && [ "${DSV41_PROBE:-0}" != "1" ] && [ "$DSV41_LB_MODE" = "external" ]; then
   for p in "$DSV41_DP_SUPERVISOR_PORT" $(seq "$DSV41_DP_BASE_PORT" $((DSV41_DP_BASE_PORT + DSV41_DP - 1))); do
     busy=0
     if command -v ss >/dev/null 2>&1; then
@@ -202,8 +216,19 @@ export HCCL_BUFFSIZE
 export HCCL_OP_EXPANSION_MODE="$DSV41_HCCL_OP_EXPANSION_MODE"
 [ "$DSV41_USE_V2" = "1" ] && export VLLM_USE_V2_MODEL_RUNNER=1
 
+# Air-gapped nodes: the model is a local directory; stop transformers / hub /
+# vLLM from probing the internet (each probe otherwise waits for a timeout).
+if [ "$DSV41_OFFLINE" = "1" ]; then
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+  export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
+fi
+
+# Tag every process launched below (server, workers, router). Cleanup and
+# kill_vllm.sh only touch tagged processes, never other vLLM/NPU jobs on the node.
+export DSV41_PROC_TAG="$DSV41_INSTANCE_ID"
+
 # jemalloc reduces allocator contention during long decode loops.
-JEMALLOC=${DSV41_JEMALLOC:-$DSV41_ROOTFS/usr/lib/aarch64-linux-gnu/libjemalloc.so.2}
+JEMALLOC=${DSV41_JEMALLOC:-$RFS/usr/lib/aarch64-linux-gnu/libjemalloc.so.2}
 if [ -f "$JEMALLOC" ]; then
   export LD_PRELOAD="$JEMALLOC${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
@@ -220,16 +245,29 @@ export VLLM_ASCEND_V41_ENGRAM_WKV_TP="${VLLM_ASCEND_V41_ENGRAM_WKV_TP:-1}"
 
 # ---- rootfs Python + CANN --------------------------------------------------
 export PYTHONHOME="$PYTHON_HOME_DIR"
-export PYTHONPATH="$DSV41_ROOTFS/vllm-workspace/vllm-ascend:$DSV41_ROOTFS/vllm-workspace/vllm"
+export PYTHONPATH="$RFS/vllm-workspace/vllm-ascend:$RFS/vllm-workspace/vllm"
 # Use the concrete cann-9.2.0 directory, not the ascend-toolkit/latest symlink:
 # the driver performs a host-path check that fails through the symlink.
 export ASCEND_HOME_PATH="$CANN"
 export ASCEND_TOOLKIT_HOME="$CANN"
 export ASCEND_OPP_PATH="$CANN/opp"
 export ASCEND_AICPU_PATH="$CANN"
-export LD_LIBRARY_PATH="$CANN/lib64:$CANN/lib64/plugin/opskernel:$CANN/lib64/plugin/nnengine:$CANN/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:$DSV41_ROOTFS/usr/local/Ascend/driver/lib64:$DSV41_ROOTFS/usr/local/Ascend/driver/lib64/common:$DSV41_ROOTFS/usr/local/Ascend/driver/lib64/driver:$DSV41_ROOTFS/usr/local/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$CANN/lib64:$CANN/lib64/plugin/opskernel:$CANN/lib64/plugin/nnengine:$CANN/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:$RFS/usr/local/Ascend/driver/lib64:$RFS/usr/local/Ascend/driver/lib64/common:$RFS/usr/local/Ascend/driver/lib64/driver:$RFS/usr/local/lib:${LD_LIBRARY_PATH:-}"
 export PATH="$CANN/bin:$PYTHON_HOME_DIR/bin:${PATH:-}"
 export PYTHONPATH="$CANN/python/site-packages:$PYTHONPATH"
+
+# Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
+# Imports the stack with the exact serving environment (rootfs/container Python,
+# CANN, host driver libs), prints versions and the visible NPU count, and exits.
+if [ "${DSV41_PROBE:-0}" = "1" ]; then
+  exec "$PY" -c '
+import torch, torch_npu
+print("torch", torch.__version__, "torch_npu", torch_npu.__version__)
+print("npu_count", torch.npu.device_count())
+import vllm, vllm_ascend
+print("vllm", vllm.__version__, "vllm_ascend", getattr(vllm_ascend, "__version__", "?"))
+'
+fi
 
 # ---- compose arguments -----------------------------------------------------
 SPEC_JSON=$(printf '{"num_speculative_tokens":%s,"method":"dspark","enforce_eager":false}' "$DSV41_SPEC_TOKENS")
@@ -279,6 +317,7 @@ fi
 [ -n "$DSV41_API_KEY" ] && ARGS+=(--api-key "$DSV41_API_KEY")
 [ "$DSV41_ENABLE_EXPERT_PARALLEL" = "1" ] && ARGS+=(--enable-expert-parallel)
 [ "$DSV41_ENABLE_PREFIX_CACHING" = "1" ] && ARGS+=(--enable-prefix-caching)
+[ "$DSV41_ENABLE_PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
 if [ -n "${DSV41_EXTRA_SERVE_ARGS// /}" ]; then
   # Deliberately simple word splitting: do not put spaces inside a value here.
   # shellcheck disable=SC2206
@@ -287,10 +326,10 @@ if [ -n "${DSV41_EXTRA_SERVE_ARGS// /}" ]; then
 fi
 
 # ---- launch ----------------------------------------------------------------
-echo "[serve] ROOTFS=$DSV41_ROOTFS"
+echo "[serve] runtime=$DSV41_RUNTIME ROOTFS=$DSV41_ROOTFS instance=$DSV41_INSTANCE_ID offline=$DSV41_OFFLINE"
 echo "[serve] model=$DSV41_MODEL tp=$DSV41_TP dp=$DSV41_DP port=$DSV41_PORT served=$DSV41_SERVED_NAME"
 echo "[serve] api-key: $([ -n "$DSV41_API_KEY" ] && echo "已启用 (len=${#DSV41_API_KEY})" || echo "未启用 (仅限内网)")"
-echo "[serve] V2=$DSV41_USE_V2 DSpark K=$DSV41_SPEC_TOKENS FULL_DECODE_ONLY max_len=$DSV41_MAX_MODEL_LEN"
+echo "[serve] V2=$DSV41_USE_V2 DSpark K=$DSV41_SPEC_TOKENS FULL_DECODE_ONLY max_len=$DSV41_MAX_MODEL_LEN prompt_tokens_details=$DSV41_ENABLE_PROMPT_TOKENS_DETAILS"
 echo "[serve] gates: triton_slot=$VLLM_ASCEND_V41_TRITON_SLOT_MAPPING rope_idx=$VLLM_ASCEND_ROPE_INDEX_SELECT moe_mask=$VLLM_ASCEND_V41_MOE_MASK_RANGE qli=$VLLM_ASCEND_V41_QLI_NO_CANDIDATE engram_wkv_tp=$VLLM_ASCEND_V41_ENGRAM_WKV_TP o_proj_2d=$VLLM_ASCEND_V41_O_PROJ_2D"
 echo "[serve] engram: cpu_offload=true dp_shared_memory=true"
 echo "[serve] 日志：$LOG_FILE"

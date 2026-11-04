@@ -69,10 +69,32 @@ unset _dsv41_cfg _dsv41_env_backup
 : "${DSV41_DP_BASE_PORT:=$((DSV41_PORT + 1))}"
 : "${DSV41_DP_SUPERVISOR_PORT:=$((DSV41_PORT - 1))}"
 
+# ---- runtime ---------------------------------------------------------------
+# native: run the extracted rootfs directly on the host (needs host glibc >= the
+#         image's, i.e. 2.35 for the Ubuntu 22.04 based Ascend image).
+# docker: run vLLM inside a long-lived container created from a locally loaded
+#         image (scripts/container.sh). Works on older hosts such as Kylin V10
+#         (glibc 2.28) and needs no registry access.
+: "${DSV41_RUNTIME:=native}"
+: "${DSV41_IMAGE:=quay.io/ascend/vllm-ascend:v0.30.0rc2-a3}"
+: "${DSV41_CONTAINER:=dsv41}"
+: "${DSV41_STATE_DIR:=$DSV41_PROJECT_ROOT/state}"
+# Identifies the processes of this deployment (see "process scoping" below).
+: "${DSV41_INSTANCE_ID:=dsv41-$DSV41_PORT}"
+
+case "$DSV41_RUNTIME" in
+  native|docker) ;;
+  *)
+    echo "[common] DSV41_RUNTIME 只能是 native 或 docker (当前: $DSV41_RUNTIME)" >&2
+    return 1 2>/dev/null || exit 1
+    ;;
+esac
+
 export DSV41_ROOTFS DSV41_MODEL DSV41_RESULTS DSV41_LOG_DIR DSV41_PID_DIR
 export DSV41_PORT DSV41_HOST DSV41_SERVED_NAME DSV41_DP DSV41_TP
 export DSV41_API_KEY DSV41_SERVE_PID_FILE DSV41_WATCHDOG_PID_FILE DSV41_ROUTER_PID_FILE
 export DSV41_DP_BASE_PORT DSV41_DP_SUPERVISOR_PORT
+export DSV41_RUNTIME DSV41_IMAGE DSV41_CONTAINER DSV41_STATE_DIR DSV41_INSTANCE_ID
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -85,6 +107,24 @@ dsv41_unset_proxy() {
 
 dsv41_log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+# True when the current shell already runs inside the project's container
+# (container.sh creates it with DSV41_IN_CONTAINER=1).
+dsv41_in_container() {
+  [ "${DSV41_IN_CONTAINER:-0}" = "1" ]
+}
+
+# With DSV41_RUNTIME=docker, scripts that need the image's Python / sources
+# call this near the top: it re-runs the script inside the container (and never
+# returns). On the native runtime, or when already in the container, it is a no-op.
+#   dsv41_reexec_in_container "$SELF_DIR/serve.sh" "$@"
+dsv41_reexec_in_container() {
+  [ "$DSV41_RUNTIME" = "docker" ] || return 0
+  dsv41_in_container && return 0
+  local script="$1"
+  shift
+  exec bash "$DSV41_PROJECT_ROOT/scripts/container.sh" exec -- bash "$script" "$@"
 }
 
 # True when a cmdline belongs to this deployment's vLLM server. External-LB
@@ -152,17 +192,42 @@ dsv41_collect_descendants() {
   echo "$seen"
 }
 
-# Best-effort cleanup of this instance's main process, descendants and
-# (optionally) any leftover VLLM:: worker processes on the machine.
-# Set DSV41_CLEAN_ALL_VLLM=0 when sharing the node with other vLLM services.
+# ---- process scoping -------------------------------------------------------
+# serve.sh exports DSV41_PROC_TAG=<DSV41_INSTANCE_ID> right before it launches
+# the vLLM server and the router, so every descendant — including orphaned
+# workers whose parent already died — carries the tag in /proc/<pid>/environ.
+# Cleanup only touches tagged processes: other vLLM / NPU jobs sharing the node
+# (other models, other containers) are never killed.
+dsv41_instance_pids() {
+  local p pid
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] && continue
+    [ -r "$p/environ" ] || continue
+    if grep -qazxF -- "DSV41_PROC_TAG=$DSV41_INSTANCE_ID" "$p/environ" 2>/dev/null; then
+      echo "$pid"
+    fi
+  done
+}
+
+# Best-effort cleanup of this deployment only: the serve supervisor and its
+# descendants, the router, and any orphaned process carrying our tag.
+# DSV41_CLEAN_ALL_VLLM=1 additionally kills EVERY VLLM:: process on the machine
+# (legacy single-tenant behaviour; off by default).
 dsv41_cleanup_residual() {
   local pid pids=""
   pid=$(dsv41_find_serve_pid || true)
   if [ -n "$pid" ]; then
     pids="$(dsv41_collect_descendants "$pid") $pid"
   fi
-  if [ "${DSV41_CLEAN_ALL_VLLM:-1}" = "1" ]; then
+  pid=$(dsv41_find_router_pid || true)
+  if [ -n "$pid" ]; then
+    pids="$pids $pid"
+  fi
+  pids="$pids $(dsv41_instance_pids | tr '\n' ' ')"
+  if [ "${DSV41_CLEAN_ALL_VLLM:-0}" = "1" ]; then
     local extra
+    dsv41_log "DSV41_CLEAN_ALL_VLLM=1：同时清理本机所有 VLLM:: 进程"
     extra=$(ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /^VLLM::/ {print $1}')
     pids="$pids $extra"
   fi

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# kill_vllm.sh — stop every vLLM instance on this node and clean NPU workers
+# kill_vllm.sh — stop THIS deployment's vLLM processes (and nothing else)
 #
-# This node is expected to host one large model at a time. The script is
-# deliberately thorough: it stops the project watchdog first (so nothing is
-# restarted behind your back), then terminates vLLM main processes, their
-# descendants and leftover NPU worker processes listed by npu-smi.
+# It stops the project watchdog first (so nothing is restarted behind your
+# back), then terminates the serve supervisor, its descendants, the router and
+# any orphaned worker of this deployment. Orphans are recognised by the
+# DSV41_PROC_TAG that serve.sh puts into every process it launches, so other
+# vLLM / NPU jobs sharing the node (other models, other containers) are never
+# touched.
 #
 # Usage:
-#   bash scripts/kill_vllm.sh                  # watchdog + all vLLM + workers
+#   bash scripts/kill_vllm.sh                  # watchdog + this deployment's vLLM
 #   bash scripts/kill_vllm.sh --only-vllm      # keep watchdog running
 #   bash scripts/kill_vllm.sh --dry-run        # show what would be done
+#   bash scripts/kill_vllm.sh --all            # legacy: EVERY vLLM / VLLMWorker on the node
 #   PORT=8021 bash scripts/kill_vllm.sh        # only this port's process tree
 #   PORT=8021 bash scripts/kill_vllm.sh --only-vllm --dry-run
 #
@@ -28,13 +31,15 @@ PORT_FILTER=${PORT:-}
 ONLY_VLLM=0
 DRY=0
 VERBOSE=0
+ALL=0
 for a in "$@"; do
   case "$a" in
     --only-vllm)   ONLY_VLLM=1 ;;
     --dry-run)     DRY=1 ;;
+    --all)         ALL=1 ;;
     --verbose|-v)  VERBOSE=1 ;;
     --port)        PORT_FILTER="$2"; shift ;;
-    -h|--help)     sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,22p' "$0"; exit 0 ;;
   esac
 done
 
@@ -124,7 +129,16 @@ collect_vllm_pids() {
     done
     return
   fi
-  # All vLLM engines on the machine.
+  if [ "$ALL" != 1 ]; then
+    # This deployment only: the serve supervisor's process tree plus every
+    # process (incl. orphans and the router) carrying our DSV41_PROC_TAG.
+    local root
+    root=$(dsv41_find_serve_pid || true)
+    if [ -n "$root" ]; then gather_descendants "$root"; fi
+    dsv41_instance_pids
+    return
+  fi
+  # --all: all vLLM engines on the machine.
   ps -eo pid=,comm= 2>/dev/null | awk '$2 ~ /^VLLM::/ {print $1}'
   for p in /proc/[0-9]*; do
     pid=${p#/proc/}
@@ -164,7 +178,10 @@ npu_worker_pids() {
 }
 
 kill_npu_workers() {
-  [ -n "$PORT_FILTER" ] && return 0   # port mode relies on the process tree
+  # Only --all kills whatever npu-smi lists: PIDs of other tenants' workers
+  # show up there too. Port / default mode rely on the process tree + tag.
+  [ -n "$PORT_FILTER" ] && return 0
+  [ "$ALL" = 1 ] || return 0
   local pids
   pids=$(npu_worker_pids | tr '\n' ' ')
   [ -n "${pids// /}" ] || return 0
@@ -179,7 +196,7 @@ wait_clear() {
     kill_npu_workers
     remain=$(collect_vllm_pids | sort -u | tr '\n' ' ')
     npu_left=""
-    [ -z "$PORT_FILTER" ] && npu_left=$(npu_worker_pids | tr '\n' ' ')
+    [ -z "$PORT_FILTER" ] && [ "$ALL" = 1 ] && npu_left=$(npu_worker_pids | tr '\n' ' ')
     if [ -z "${remain// /}" ] && [ -z "${npu_left// /}" ]; then
       log "清理完成（无 vLLM 进程 / NPU worker 残留）"
       return 0
@@ -201,9 +218,13 @@ fi
 wait_clear
 rc=$?
 
-echo "=== 残留 VLLM:: 进程 ==="
+if [ "$ALL" = 1 ]; then
+  echo "=== 残留 VLLM:: 进程 ==="
+else
+  echo "=== 本机 VLLM:: 进程（含其它部署，未触碰；本部署的已在上方清理）==="
+fi
 ps -eo pid,comm 2>/dev/null | awk '$2 ~ /^VLLM::/ {print}' | head || true
-echo "=== NPU VLLMWorker 数量 ==="
+echo "=== NPU VLLMWorker 数量（npu-smi，含其它部署）==="
 npu_worker_pids | wc -l
 echo "=== 端口监听 ($DSV41_PORT) ==="
 if command -v ss >/dev/null 2>&1; then

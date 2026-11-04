@@ -69,8 +69,8 @@ ROUTER_RESTART=1 bash scripts/serve.sh    # 只重启 router，不动 vLLM
 | 症状 | 原因 | 修复 |
 |---|---|---|
 | `pgrep -f "Worker_DP"` 杀错进程 | 命令行自身被匹配 | 用 `ps -eo comm` 匹配 `VLLM::` 前缀；脚本已如此实现 |
-| 停服务后端口仍被占用 | ApiServer/EngineCore 子进程残留 | `bash scripts/kill_vllm.sh` |
-| NPU 仍显示 `VLLMWorker_DP` | worker 未随主进程退出 | `bash scripts/kill_vllm.sh`（内部循环调用 `npu-smi`） |
+| 停服务后端口仍被占用 | ApiServer/EngineCore 子进程残留 | `bash scripts/kill_vllm.sh`（只清理本部署的进程，含孤儿 worker） |
+| NPU 仍显示 `VLLMWorker_DP` | 可能是本部署的残留，也可能是同机其它模型 | 先 `kill_vllm.sh`；仍在的多半不属于本部署（脚本刻意不动它们）。确认整机只跑本服务时才用 `kill_vllm.sh --all` |
 | 端口释放但 HBM 未释放 | 进程处于不可中断状态 | 等待或重启节点；确认没有 NFS 卡死 |
 | watchdog 把服务反复拉起 | 手工 `STOP=1` 时 watchdog 仍在运行 | 先 `watchdog.sh stop` 再停服务 |
 
@@ -95,6 +95,23 @@ grep -E ':15B5|:15B6' /proc/net/tcp   # 5557/5558
 | rootfs 树缺少 `.so` | 镜像层缺失或解包异常 | `setup_rootfs.sh --force`；检查 `<rootfs>/.dsv41-image` |
 | `git apply` 冲突 | 补丁与镜像版本不匹配 | `apply_patches.sh check` 定位；重新生成补丁 |
 | 回滚失败 | rootfs 不是 git 工作树 | 重新解包 rootfs |
+
+---
+
+## 4b. docker 运行时（离线 / 旧 glibc 宿主）
+
+| 症状 | 原因 | 修复 |
+|---|---|---|
+| `version 'GLIBC_2.3x' not found`（直接用 rootfs 跑） | 宿主 glibc 2.28 < 镜像的 2.35 | 改用 `DSV41_RUNTIME=docker`（`docs/offline-deployment.md`） |
+| `container.sh up`：`本机没有镜像` | 镜像未加载或 tag 不同 | `docker images`；`docker load -i`；或设置 `DSV41_IMAGE` |
+| `缺少必需的挂载源 …driver/lib64 / npu-smi` | 宿主驱动路径不在默认位置 | 确认 `/usr/local/Ascend/driver/lib64`、`/usr/local/bin/npu-smi` 存在 |
+| `DSV41_PID_DIR 不能是 /tmp` | docker 运行时要把 pid 目录挂进容器 | `DSV41_PID_DIR=/run/dsv41` |
+| `容器 dsv41 未运行` | 容器被停止/删除 | `bash scripts/container.sh up` |
+| 改了挂载/参数没生效 | 容器是创建时固化的 | `bash scripts/container.sh recreate`（补丁会自动重新应用） |
+| `DSV41_PROBE=1 bash scripts/serve.sh` 报 `ImportError` / `libXXX.so` | 驱动库未挂载或环境缺失 | 看报错库名；`container.sh shell` 里 `ldd`；必要时 `DSV41_CONTAINER_SOURCE_ENV=1` |
+| `Free memory on device … less than desired GPU memory utilization` | 同机其它进程占用了这些 die 的 HBM | 停掉占用者，或调低 `DSV41_GPU_MEM_UTIL` |
+| `serve.sh run` 里 Ctrl-C 没停掉服务 | docker exec 不转发信号（非 TTY 时） | 在交互终端运行（自动 `-it`），或另开终端 `STOP=1 bash scripts/serve.sh` |
+| 重启宿主后服务没起来 | 未启用 systemd 单元 | `systemctl enable --now dsv41-container` |
 
 ---
 
