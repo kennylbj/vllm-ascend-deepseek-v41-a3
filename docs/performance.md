@@ -1,9 +1,14 @@
 # 性能与调优
 
-所有数据来自单机 8×Ascend 910C（A3，16 die），生产配置：
+所有数据来自单机 8×Ascend 910C（A3，16 die），配置：
 DP2/TP8、Model Runner V2、DSpark K=5、FULL_DECODE_ONLY、1M 上下文上限、
 `--max-num-batched-tokens 16384`、6 个优化 gate、
 `HCCL_OP_EXPANSION_MODE=AIV`、jemalloc、external LB + prefix router。
+
+> **默认批次已改为 8192**（`DSV41_MAX_NUM_BATCHED_TOKENS`）。本文第 1–6 节的吞吐与
+> 显存数据都是在 **16384** 批次下采集的，没有在 8192 下重测；要复现这些表请显式设
+> `DSV41_MAX_NUM_BATCHED_TOKENS=16384`。改默认的依据见第 7 节（生产日志：DP lockstep 下
+> 大 prefill 分块拖慢两个 rank 的 decode）。
 
 > **默认上下文已改为 360448**（`DSV41_MAX_MODEL_LEN`）。本文所有吞吐与显存/KV
 > 数据都是在 `--max-model-len 1048576` 下实测的；360448 下 KV 预算更宽松（可容纳更多
@@ -164,13 +169,13 @@ DSV41_MAX_MODEL_LEN=262144 bash scripts/serve.sh
 
 | `max-num-batched-tokens` | 峰值激活 | KV cache | KV tokens / DP rank | 1M 上下文并发 |
 |---:|---:|---:|---:|---:|
-| 8192 | ≈4.1 GiB | ≈9.7 GiB | 2,091,049 | 1.99× |
-| **16384（生产）** | **≈8.2 GiB** | **≈6.7 GiB** | **1,268,538** | **1.21×** |
+| **8192（当前默认）** | ≈4.1 GiB | ≈9.7 GiB | 2,091,049 | 1.99× |
+| 16384（本文基准数据的口径） | ≈8.2 GiB | ≈6.7 GiB | 1,268,538 | 1.21× |
 | 32768（未采用） | ≈16.4 GiB（线性外推） | 预算为负 | < 1M | 无法满足 1M 上下文 |
 
 32768 要让总占用回到 55.15 GiB 预算内，必须把 `max-model-len` 降到约 512K；
-如果坚持 1M 上下文，**不要开 32768**。16384 是当前 1M 上下文下能保住的
-最大批次。
+如果坚持 1M 上下文，**不要开 32768**。16384 是 1M 上下文下能保住的最大批次；
+默认取 8192 是为了缩短 DP lockstep 下的 decode 停顿并多留 KV（第 7 节）。
 
 ### 图桶
 
@@ -229,3 +234,69 @@ DSV41_SPEC_TOKENS=5     # 默认；DSpark 训练块大小
 2K 单热前缀 @c32 约 1.83k tok/s；双前缀约 2.25k，说明热前缀亲和会牺牲部分
 DP2 利用率。需要更高并发时，优先评估缩短 `max-model-len` 或增加节点，而不是继续抬高
 `gpu-memory-utilization`——后者会把 OOM 风险转成运行时抖动。
+
+---
+
+## 7. 生产日志分析：DP lockstep 与 prefill 停顿
+
+上面的基准都是短 prompt、少量前缀。真实长上下文负载下，总输出 tok/s 的大幅波动主要不是
+router 或 prefix cache 的问题。数据来自 2026-11-04 08:16–12:26 的 `serve_*.log`
+（约 2100 个请求，平均 prompt 约 66–84K token，`--max-num-batched-tokens 16384`，
+`--max-num-seqs 32`，启动日志 `NPU KV cache size: 848,184 tokens`/DP rank），用
+`scripts/analyze_serve_log.py` 复现：
+
+```bash
+python3 scripts/analyze_serve_log.py logs/serve_*.log                       # 全程
+python3 scripts/analyze_serve_log.py logs/serve_*.log --since 09:40 --until 10:40
+```
+
+| 指标（10 秒窗口，两个 rank 都在跑 ≥5 个请求） | 数值 |
+|---|---|
+| 总输出 tok/s：均值 / 中位数 / p95 | 158 / 30 / 695 |
+| 两个 rank 同时“停顿”（各 ≤40 tok/s）的窗口占比 | **65.6%** |
+| 两个 rank 同时“健康”（各 ≥150 tok/s）的窗口占比（此时合计均值） | 19.0%（590 tok/s） |
+| 一个 rank 停顿时另一个也停顿的概率（对比无条件概率） | 0.98（0.66） |
+| 两个 rank 输出 tok/s 的相关系数 | 0.95 |
+| 单步耗时（由推测解码计数估算）：健康 / 停顿 | ≈107 ms / ≈2.5 s |
+| 有 rank 在做 prefill（KV 10 秒内增长 ≥1%）时的停顿占比 / 合计 tok/s | 78.1% / 110 |
+| 没有 prefill（KV 基本不涨）时 | 31.0% / 285 |
+| 停顿持续时间：中位 / p90 / 最长 | 30 s / 90 s / 280 s |
+
+**机制。** DP2 + 专家并行下，两个 EngineCore 每一步都要同步（MoE 的 all-to-all 跨越 DP×TP；
+vLLM `DPEngineCoreProc.run_busy_loop` 每步做全局同步，空闲 rank 也要跑 dummy batch）。
+一个 rank 处理 16384 token 的 prefill 分块时，这一步要 ~2.5 s，另一个 rank 的 decode 也
+只能跟着每 2.5 s 走一步，于是约 10 个正在 decode 的请求每秒只产出 ~1 token/请求。
+这解释了为什么 router 把缓存命中率做到 81–91% 之后总吞吐仍然被 prefill 主导。
+
+**另一个独立的问题：一个 rank KV 被打满。** 09:40–10:40 rank0 的 KV 平均 86–87%
+（p90 约 97%）并有约 3 个请求排队，rank1 只有 46–58%、没有排队；rank0 每 20 分钟重算
+约 6M 未命中 token，rank1 约 1M，rank0 命中率从 84% 掉到 58%，输出 tok/s 减半。
+两个 rank 的 active 请求数只差 1–2 个。这是旧版按请求数均衡的 router 看不到的，
+新版 `cost` 策略（`docs/router.md` 3.2）用 KV 使用率 / 排队深度 / prefill 排队 token 来避开。
+
+**router 能做什么、不能做什么。** 能：不让某个 rank 被打满、把冷请求的 prefill 摊到两个
+rank（两个 rank 同时 prefill 时，一个停顿窗口推进的 prompt KV 约为只有一个 rank prefill
+时的 2.6 倍，而 decode 输出同样被拖慢）。不能：消除 lockstep 本身。若这些都不够，剩下的是
+架构层面的选择（例如单引擎 TP16、或 prefill/decode 分离），不在本仓库范围。
+
+### 默认批次改为 8192，以及如何验证
+
+停顿步的时长与 prefill 分块大小成正比；同时 8192 比 16384 少占约 4 GiB/die 激活
+（见第 4 节），其中大部分变成 KV（第 4 节实测 6.7 → 9.7 GiB/die，1M 上下文口径）。
+上面那次日志里 KV（848K token/rank，约 10 个请求）是并发上限，所以默认改为 8192。
+**这是依据日志机制做的改动，尚未在 8192 下实测**——预期是停顿步变短、KV 更宽松，代价是
+prefill 效率下降、大块未命中 prompt 的 TTFT 变长。
+
+```bash
+# config/dsv41.local.env  —  对比基线时可显式设回
+DSV41_MAX_NUM_BATCHED_TOKENS=16384    # 改动会进入编译缓存 key → 冷启动
+```
+
+判据：用 `analyze_serve_log.py` 比较“两 rank 同时停顿占比”“总输出 tok/s 均值 / p5”
+“KV p90 与排队”，同时看客户端侧 TTFT p95，并核对启动日志的 `NPU KV cache size`
+（16384 时是 848,184 token/rank）。每组至少跑 60 分钟——上面那次 KV 打满持续了约一小时。
+如果同时升级了 router 策略，想分开归因，就让第一组仍用 16384、第二组再改回 8192。
+**注意**：已有的 `config/dsv41.local.env` / `dsv41.docker.env` 里的显式值会覆盖默认值。
+
+**口径提醒。** “停顿”阈值（≤40 / ≥150 tok/s）和“KV 增长 ≈ prefill”都是代理指标，
+`min-running` 等参数可在脚本里调；表中数字用于判断方向，不是容量规划值。

@@ -29,16 +29,19 @@
   不继承环境变量导致的静默失效。
 - **前缀/ KV 感知路由**：external LB 模式下 DP0/DP1 各自监听独立端口，router 消费
   vLLM KV 事件，按最长 token 前缀把相同 system prompt / 长文档粘到同一 rank；
-  无命中时按最少 active 回退，并可限制单 rank 偏斜。详见
+  默认的 `cost` 策略以 token 为单位给各 rank 打分（未命中 prompt + prefill 排队量 +
+  KV 饱和罚分），不再只看请求数，`DSV41_ROUTER_POLICY=legacy` 可回退。详见
   [`docs/router.md`](docs/router.md)。
+- **日志分析**：`scripts/analyze_serve_log.py` 从 serve 日志量化输出 tok/s 的停顿占比、
+  两个 rank 的 lockstep 耦合、KV 饱和，用于前后对比（`docs/performance.md` 第 7 节）。
 - **无人值守**：`watchdog.sh` 轮询 `/health`，宽限期 + 自动重启 + 日志轮转。
 - **可观测 / 可验证**：冒烟测试、2K 吞吐压测、8K 推测解码接受率压测。
 
 ## 实测吞吐
 
 单机 8×910C（DP2/TP8），`completions` 接口，约 2K prompt / 256 output，
-temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**，
-2026-11-02 实测（机器无其它在线流量）：
+temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**（默认批次现为
+8192，下表未在 8192 下重测），2026-11-02 实测（机器无其它在线流量）：
 
 | 并发 | 单前缀总吞吐 (tok/s) | 双前缀总吞吐 (tok/s) |
 |---:|---:|---:|
@@ -108,6 +111,7 @@ temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**，
 │   ├── kill_vllm.sh             # 彻底清理 vLLM / NPU worker
 │   ├── patch_utils.py           # 补丁状态判定（含 gate 默认值归一化）
 │   ├── prefix_router.py         # external LB 前缀 / KV 感知路由器
+│   ├── analyze_serve_log.py     # serve 日志分析（停顿 / lockstep / KV），只读
 │   ├── bench_2k.py              # 2K prompt 吞吐（单前缀）
 │   ├── bench_8k.py              # 8K prompt + 接受率（单前缀）
 │   ├── bench_dual.py            # 双前缀 DP2 并发吞吐
@@ -116,7 +120,9 @@ temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**，
 ├── tests/
 │   ├── smoke_test.py            # 在线冒烟测试
 │   ├── test_container.py        # 容器命令组装 / 进程清理范围单元测试
-│   ├── test_router_logic.py     # router 前缀/路由/引用计数单元测试
+│   ├── test_analyze_serve_log.py # 日志分析脚本单元测试
+│   ├── test_router_logic.py     # router 前缀/路由/打分/引用计数单元测试
+│   ├── test_router_proxy.py     # router 代理路径测试（假 vLLM rank，无需 NPU）
 │   └── test_tools.py            # 离线工具单元测试
 └── requirements.txt             # 客户端/压测可选依赖
 ```

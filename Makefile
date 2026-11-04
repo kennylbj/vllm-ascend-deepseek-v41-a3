@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart smoke bench bench8 test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
+.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart smoke bench bench8 analyze test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
 
 help:
 	@echo "vllm-ascend-deepseek-v41-a3"
@@ -30,7 +30,8 @@ help:
 	@echo "  make smoke           冒烟测试"
 	@echo "  make bench           2K 吞吐压测"
 	@echo "  make bench8          8K 推测解码压测"
-	@echo "  make test            单元测试（patch 状态 / OCI 解包）"
+	@echo "  make analyze LOG=... serve 日志分析（停顿占比 / lockstep / KV 饱和）"
+	@echo "  make test            单元测试（patch 状态 / OCI 解包 / router / 日志分析）"
 	@echo "  make lint            bash -n / py_compile"
 
 doctor:
@@ -98,6 +99,10 @@ bench:
 
 bench8:
 	python3 $(ROOT)/scripts/bench_8k.py
+
+analyze:
+	@test -n "$(LOG)" || { echo "usage: make analyze LOG=logs/serve_xxx.log [ARGS='--since 09:30']"; exit 2; }
+	python3 $(ROOT)/scripts/analyze_serve_log.py $(LOG) $(ARGS)
 
 test:
 	python3 -m unittest discover -s $(ROOT)/tests -v

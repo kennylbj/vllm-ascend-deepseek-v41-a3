@@ -124,7 +124,7 @@ PID 文件缺失时，脚本会扫描 `/proc/*/cmdline`：external 模式匹配
 > 下表为 `--max-model-len 1048576` 下的实测值；默认上下文现为 360448，KV cache 预算
 > 相应更宽松，未重新采集。
 
-| 项 | 8192 批次 | 16384 批次（当前） |
+| 项 | 8192 批次（当前默认） | 16384 批次（实测口径） |
 |---|---:|---:|
 | 权重 | ≈38.3 GiB | ≈38.7 GiB |
 | 峰值激活 | ≈4.1 GiB | ≈8.2 GiB |
@@ -136,7 +136,9 @@ PID 文件缺失时，脚本会扫描 `/proc/*/cmdline`：external 模式匹配
 | `gpu-memory-utilization` | 0.90（55.15 GiB 预算） | 0.90（55.15 GiB 预算） |
 
 16384 批次用 KV 余量换 prefill 吞吐；32768 需要约 16.4 GiB 激活，在 1M 上下文
-下放不进 0.90 预算（即使把利用率抬到 0.98，KV 也不足 1M），因此生产停在 16384。
+下放不进 0.90 预算（即使把利用率抬到 0.98，KV 也不足 1M），因此上限停在 16384。
+默认现取 8192：DP2+EP 下两个 EngineCore 逐步同步，大 prefill 分块会拖慢两个 rank 的
+decode，8192 同时多留约 3 GiB/die 给 KV（见 `docs/performance.md` 第 7 节）。
 
 如修改 `--max-model-len`、`--max-num-seqs` 或 `--max-num-batched-tokens`，KV cache
 与图内存都会变化；日志里的 `Free memory on device` 行会给出可选

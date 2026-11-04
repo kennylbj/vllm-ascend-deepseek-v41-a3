@@ -29,7 +29,7 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # ---- tunables (override via environment or config/*.env) --------------------
 : "${DSV41_MAX_MODEL_LEN:=360448}"                # 2816 x 128 (block-aligned)
-: "${DSV41_MAX_NUM_BATCHED_TOKENS:=8192}"
+: "${DSV41_MAX_NUM_BATCHED_TOKENS:=8192}"        # DP2+EP lockstep: smaller prefill chunk = shorter decode stall
 : "${DSV41_MAX_NUM_SEQS:=32}"
 : "${DSV41_GPU_MEM_UTIL:=0.9}"
 : "${DSV41_BLOCK_SIZE:=128}"
@@ -57,7 +57,14 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${DSV41_KV_EVENTS_BASE_PORT:=5557}"
 : "${DSV41_ROUTER_SCRIPT:=$SELF_DIR/prefix_router.py}"
 : "${DSV41_ROUTER_LOG:=$DSV41_RESULTS/router.log}"
-: "${DSV41_ROUTER_MAX_SKEW:=8}"
+: "${DSV41_ROUTER_MAX_SKEW:=8}"                # legacy policy only
+# cost (default): score ranks in tokens - uncached prompt + queued prefill + KV saturation.
+# legacy: longest prefix wins unless the active-request gap exceeds DSV41_ROUTER_MAX_SKEW.
+: "${DSV41_ROUTER_POLICY:=cost}"
+: "${DSV41_ROUTER_KV_HIGH:=0.90}"               # KV usage (0-1) at which a rank counts as saturated
+: "${DSV41_ROUTER_SAT_PENALTY:=32768}"          # tokens added to a saturated / queueing rank's score
+: "${DSV41_ROUTER_PREFILL_WEIGHT:=0.5}"         # weight of prompt tokens already queued for prefill
+: "${DSV41_ROUTER_LOAD_INTERVAL:=2}"            # seconds between /metrics scrapes (0 disables)
 
 RUN_ID="dsv41w8a8rc2-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$DSV41_RESULTS/serve_${RUN_ID}.log"
@@ -77,7 +84,10 @@ stop_router() {
 start_router() {
   local i
   local -a rargs=(--listen "$DSV41_PORT" --host "$DSV41_HOST" --model "$DSV41_SERVED_NAME"
-    --block-size "$DSV41_BLOCK_SIZE" --max-skew "$DSV41_ROUTER_MAX_SKEW")
+    --block-size "$DSV41_BLOCK_SIZE" --max-skew "$DSV41_ROUTER_MAX_SKEW"
+    --policy "$DSV41_ROUTER_POLICY" --kv-high "$DSV41_ROUTER_KV_HIGH"
+    --sat-penalty "$DSV41_ROUTER_SAT_PENALTY" --prefill-weight "$DSV41_ROUTER_PREFILL_WEIGHT"
+    --load-interval "$DSV41_ROUTER_LOAD_INTERVAL")
   for i in $(seq 0 $((DSV41_DP - 1))); do
     rargs+=(--upstream "http://127.0.0.1:$((DSV41_DP_BASE_PORT + i))")
     if [ "$DSV41_KV_EVENTS" = "1" ]; then

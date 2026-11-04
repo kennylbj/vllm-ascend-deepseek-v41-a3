@@ -47,8 +47,9 @@ tail -n 200 logs/serve_*.log
 | `/health` 503，但 8022/8023 各自 200 | router 健康轮询尚未完成 | 等 5 s；看 `logs/router.log` |
 | `/router/stats` 401 | stats 默认要求 `DSV41_API_KEY` | 带 `Authorization: Bearer ...` |
 | `cached_prefix_digests=0` | 请求 <128 token / router 刚重启 / 无 KV 事件 | 发 >128 token 请求；确认 5557/5558 |
-| 路由长期只打一个 rank | 热前缀 + skew 太小 | 调大 `DSV41_ROUTER_MAX_SKEW` 或拆分前缀 |
-| 两 rank 流量不均但健康 | 前缀亲和策略的正常代价 | 需要纯吞吐可回退 `DSV41_LB_MODE=internal` |
+| 路由长期只打一个 rank | 热前缀；或 `legacy` 策略下 skew 太小 | 默认 `cost` 策略会按 token / KV 负载分流；`legacy` 下调大 `DSV41_ROUTER_MAX_SKEW` |
+| 两 rank 流量不均但健康 | 前缀亲和的正常代价 | 看 `/router/stats` 的 `inflight_tokens` / `kv_usage`；需要纯吞吐可回退 `DSV41_LB_MODE=internal` |
+| 总输出 tok/s 大幅波动、`Running` 不低但 `generation throughput` 只有个位数 | DP+EP lockstep：一个 rank 的长 prefill 分块拖慢两个 rank 的 decode；或一个 rank KV 被打满 | `python3 scripts/analyze_serve_log.py logs/serve_*.log`，对照 `docs/performance.md` 第 7 节 |
 | router 起不来 | 缺 aiohttp/pyzmq/msgspec | 用 rootfs Python 启动（serve.sh 已保证）或 `pip install -r requirements.txt` |
 
 router 诊断：

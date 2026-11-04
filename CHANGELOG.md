@@ -3,6 +3,54 @@
 All notable changes to this deployment project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — 2026-11-04
+
+Driven by the first production test (4 h of `serve_*.log`, a 10-minute router capture):
+no clear gain over the baseline and strongly fluctuating output tok/s. The logs showed
+the router's cache tracking was fine (affinity 95%, window hit rate 81–91%) but that
+(a) throughput is dominated by DP2+EP lockstep stalls caused by long prefill chunks and
+(b) one rank can be KV-saturated for an hour while request counts look balanced.
+
+### Added
+
+- **`cost` routing policy (default)** in `scripts/prefix_router.py`: each rank is scored in
+  tokens — uncached prompt + queued prefill + a penalty for a KV-saturated / queueing rank
+  (scraped from `vllm:kv_cache_usage_perc` / `vllm:num_requests_waiting`). New settings
+  `DSV41_ROUTER_POLICY|KV_HIGH|SAT_PENALTY|PREFILL_WEIGHT|LOAD_INTERVAL`;
+  `DSV41_ROUTER_POLICY=legacy` restores the request-count / `--max-skew` behaviour
+  (router-only restart: `ROUTER_RESTART=1`).
+- `/router/stats`: per-rank `inflight_tokens`, `pending_prefill`, `kv_usage`, `waiting`, and
+  `policy`, `spills`, `sat_avoid`, `digest_evicted`, `digest_resets`.
+- `scripts/analyze_serve_log.py` (+ `make analyze`): read-only serve-log analysis — stalled /
+  healthy window shares, rank-to-rank lockstep coupling, engine step time, stall vs prefill
+  activity, per-bucket KV / queue / hit rate / uncached prefill.
+- `tests/test_router_proxy.py` (fake vLLM ranks), `tests/test_analyze_serve_log.py`; router
+  logic tests now cover the cost policy, metrics parsing, digest bounds and a 12×128-token
+  KV-event fuzz against an oracle.
+- `docs/performance.md` §7 (DP lockstep and prefill stalls, with the measured numbers).
+
+### Changed
+
+- **Default `DSV41_MAX_NUM_BATCHED_TOKENS` is 8192** (the example env files used 16384; `serve.sh`
+  already fell back to 8192). With DP2+EP lockstep a 16384-token prefill chunk stalls decode on
+  both ranks for ~2.5 s, and 8192 frees ~3 GiB/die for KV. Not yet measured at 8192 — the
+  benchmark tables in `docs/performance.md` were taken at 16384 and are labelled as such.
+  An explicit value in your local env file still wins; changing it is a cold start.
+
+### Fixed
+
+- Digest table bound counted **cumulative inserts**, so a rank forgot every cached prefix
+  after ~200k new blocks (about once per rank in the analysed 4 h run). It now bounds the
+  live set and evicts the oldest 10% on overflow.
+- A client that left (timeout) made the failed response write look like an upstream error,
+  so the whole request was **re-run on the other rank**; a failure after the response had
+  started could also be replayed. Retries now happen only before any byte reaches the client.
+- Stale keep-alive connections (`Broken pipe`, router 120 s vs uvicorn 5 s): router keep-alive
+  is 4 s and a dead pooled connection is retried once on the **same** rank before failing over
+  (failing over meant a full re-prefill without the cache).
+- `min()` on an empty list (HTTP 500) when the rank holding the prefix was marked unhealthy.
+- `/tokenize` is spread over the healthy ranks instead of always hitting rank 0.
+
 ## [0.2.0] — 2026-11-03
 
 ### Added

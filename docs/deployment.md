@@ -181,7 +181,7 @@ API key、磁盘与代理环境。失败项会给出对应修复入口；建议�
 | `--max-model-len` | 360448（`DSV41_MAX_MODEL_LEN`，= 2816 × 128） | 默认上下文；1048576（1M）在 16384 批次下 KV cache 约 6.7 GiB/die（实测） |
 | `--enable-prompt-tokens-details` | on | `usage.prompt_tokens_details.cached_tokens`（`DSV41_ENABLE_PROMPT_TOKENS_DETAILS=0` 关闭） |
 | `--max-num-seqs` | 32 | 与图捕获桶上限对齐 |
-| `--max-num-batched-tokens` | 16384 | prefill 批大小；激活峰值约 8.2 GiB，32768 放不进 1M 上下文预算 |
+| `--max-num-batched-tokens` | 8192（`DSV41_MAX_NUM_BATCHED_TOKENS`） | prefill 分块大小；越大 prefill 越快但 DP lockstep 下 decode 停顿越长（16384 时单步约 2.5 s）。基准数据在 16384 下采集；32768 放不进 1M 上下文预算 |
 | `--data-parallel-multi-port-external-lb` | on | external 模式：supervisor 8020 + rank 8022/8023 |
 | `--kv-events-config` | ZMQ, `tcp://*:5557` | publisher 按 DP rank 自动偏移到 5557/5558 |
 | `--block-size` | 128 | V4.1 混合注意力要求；16 会导致输出乱码 |

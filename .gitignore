@@ -19,3 +19,4 @@ config/dsv41.local.env
 .DS_Store
 .idea/
 .vscode/
+.tmp
