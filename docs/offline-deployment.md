@@ -337,6 +337,43 @@ router，以及带这个标记的进程：
 
 ---
 
+### 可选 Memcache DRAM KV offload
+
+先用 `DSV41_KV_OFFLOAD=0` 建立基线，确认客户端使用 `model=dsv41`，并从启动日志记录各
+DP engine 的 `NPU KV cache size`。本功能复用已有前缀，执行中的请求仍需要 NPU KV 空间。
+
+1. 在目标机确认本地推理容器与 `DSV41_IMAGE` 使用相同镜像 ID。记录 Engram 和模型加载后的
+   `MemAvailable`、`df -h /dev/shm`，以及 `docker inspect -f '{{.HostConfig.Memory}}' dsv41`。
+   默认 `DSV41_KV_DRAM_GIB_PER_WORKER=2`，DP2/TP8 名义上需要 32 GiB DRAM，另需保留运行余量。
+2. 在维护窗口停止 watchdog，再执行 `bash scripts/container.sh down`。在实际使用的环境文件
+   （例如 systemd 的 `/etc/dsv41.env`）设 `DSV41_KV_OFFLOAD=1`，然后按原入口启动。
+   手动启动依次运行 `bash scripts/container.sh up` 和 `bash scripts/serve.sh`，两次使用同一配置。
+   systemd 启动会执行这两个步骤。配置目录位于 `${DSV41_RESULTS}/kv/${DSV41_CONTAINER}/`。
+3. 从服务日志核对 16 个 worker 注册容量，并用
+   `curl --noproxy '*' -fsS http://127.0.0.1:8100/metrics` 核对
+   `memcache_total_capacity_bytes` 约为 32 GiB。默认 5100 / 6100 / 8100 分别为 MetaService、
+   config store 和 metrics 端口。发生冲突时通过 Docker 环境模板中的 `DSV41_KV_*_PORT` 改端口。
+   若启动失败，查看 `docker logs dsv41-mmc-meta` 和启动器日志。
+
+**实机验收。** 在隔离测试环境临时设置 `VLLM_SERVER_DEV_MODE=1` 并将服务绑定到 loopback。
+直连一个 DP 端口（默认 external LB 下为 8022 或 8023），发送固定的约 90k token 前缀，
+等请求和池写入完成后执行
+`curl --noproxy '*' -fsS -X POST 'http://127.0.0.1:8022/reset_prefix_cache?reset_external=false'`。
+确认返回 `{"success":true}` 后向同一 DP 端口重发请求。检查
+`vllm:external_prefix_cache_hits_total` 的增量以及 Memcache 成功读取的计数，另用不同前缀
+做负对照。在受控 KV 压力下确认实际发生抢占和恢复，并将恢复后及后续池命中的贪心首 token
+与同条件 offload 关闭的结果比较。验收结束后关闭开发模式。
+
+**上线判据。** 固定新默认值和预热方法，在并发 16 / 24 / 32 各交替跑三轮开关对照。
+逐 DP engine 记录本地与外部命中、重新计算的 prefill tokens、抢占、池驱逐、p95 首 token
+延迟和解码吞吐。并发 24 和 32 的三轮中位数均应显示 prefill 重算量和 p95 首 token 延迟下降，
+解码吞吐降幅不超过 5%，并通过上述正确性验证。
+
+**关闭或恢复。** 停止 watchdog 后执行 `bash scripts/container.sh down`。如需回滚，设置
+`DSV41_KV_OFFLOAD=0` 后按原入口启动，验证 `/health`、`/v1/models` 和推理。
+开启时独立监控 Memcache 指标端口。MetaService 故障后，完整重启推理和池以重新注册，
+按冷池处理。调整容量或端口也使用完整的 `down` / `up` 流程。
+
 ## 11. 升级、回滚与卸载
 
 | 场景 | 操作 |

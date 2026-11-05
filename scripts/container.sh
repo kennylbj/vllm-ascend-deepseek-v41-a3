@@ -16,11 +16,11 @@
 # apply_patches.sh) run inside, through `docker exec`.
 #
 # Usage:
-#   bash scripts/container.sh up          # create/start (idempotent) + apply patches
+#   bash scripts/container.sh up          # create/start + apply patches + optional Memcache
 #   bash scripts/container.sh status
 #   bash scripts/container.sh exec [--] <cmd...>   # run a command inside
 #   bash scripts/container.sh shell
-#   bash scripts/container.sh down         # stop the container (kills vLLM inside!)
+#   bash scripts/container.sh down         # stop vLLM container, then clean up its MetaService
 #   bash scripts/container.sh recreate     # rm + up (after changing mounts/args)
 #   bash scripts/container.sh print-cmd    # show the docker run command, run nothing
 #   bash scripts/container.sh print-args   # same, one raw argument per line
@@ -40,6 +40,8 @@ set -Eeuo pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 . "$SELF_DIR/common.sh"
+# shellcheck source=kv_offload.sh
+. "$SELF_DIR/kv_offload.sh"
 
 : "${DSV41_DOCKER_BIN:=docker}"
 : "${DSV41_DOCKER_PRIVILEGED:=1}"
@@ -67,6 +69,88 @@ need_docker() {
 
 container_state() {
   "$DSV41_DOCKER_BIN" inspect -f '{{.State.Status}}' "$DSV41_CONTAINER" 2>/dev/null || true
+}
+
+# ---- Memcache MetaService lifecycle -----------------------------------------
+
+kv_meta_inspect() {
+  "$DSV41_DOCKER_BIN" container inspect -f "$2" "$1"
+}
+
+kv_check_ports_free() {
+  local listeners port
+  if command -v ss >/dev/null 2>&1; then
+    listeners=$(ss -ltn) || die "无法检查 Memcache 端口"
+  elif command -v netstat >/dev/null 2>&1; then
+    listeners=$(netstat -ltn) || die "无法检查 Memcache 端口"
+  else
+    die "检查 Memcache 端口需要 ss 或 netstat"
+  fi
+  for port in "$DSV41_KV_META_PORT" "$DSV41_KV_STORE_PORT" "$DSV41_KV_METRICS_PORT"; do
+    if awk -v port="$port" '$4 ~ (":" port "$") { busy=1 } END { exit !busy }' <<< "$listeners"; then
+      die "Memcache 端口 $port 已被占用，请更换 DSV41_KV_*_PORT"
+    fi
+  done
+}
+
+kv_write_file() {
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX")
+  cat > "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+kv_meta_up() {
+  local image_id="$1" name="$DSV41_CONTAINER-mmc-meta" id conf owner state deadline attempt
+  conf=$(dsv41_kv_config_dir)
+  owner="$DSV41_PROJECT_ROOT:$DSV41_INSTANCE_ID"
+  if id=$(kv_meta_inspect "$name" '{{.Id}}' 2>/dev/null); then
+    if [ "$(kv_meta_inspect "$id" '{{index .Config.Labels "io.dsv41.kv.owner"}}')" != "$owner" ] ||
+       [ "$(kv_meta_inspect "$id" '{{.Image}}')" != "$image_id" ] ||
+       [ "$(kv_meta_inspect "$id" '{{index .Config.Labels "io.dsv41.kv.config"}}')" != "$conf" ] ||
+       ! dsv41_kv_configs_match "$conf"; then
+      die "MetaService $name 的归属、镜像或配置不匹配；请核对现有容器，配置变更需先 down"
+    fi
+    state=$(kv_meta_inspect "$id" '{{.State.Status}}')
+    if [ "$state" != running ]; then
+      kv_check_ports_free
+      "$DSV41_DOCKER_BIN" start "$id" >/dev/null
+    fi
+  else
+    kv_check_ports_free
+    mkdir -p "$conf"
+    dsv41_kv_meta_config | kv_write_file "$conf/mmc-meta.conf"
+    dsv41_kv_local_config | kv_write_file "$conf/mmc-local.conf"
+    id=$("$DSV41_DOCKER_BIN" run -d --pull=never --name "$name" --init --net=host --ipc=host \
+      --label "io.dsv41.kv.owner=$owner" --label "io.dsv41.kv.config=$conf" \
+      -v "$conf:/etc/dsv41-memcache:ro" -e MMC_META_CONFIG_PATH=/etc/dsv41-memcache/mmc-meta.conf \
+      --entrypoint python3 "$image_id" -c 'from memcache_hybrid import MetaService; MetaService.main()')
+  fi
+
+  deadline=$((SECONDS + 60))
+  for ((attempt=0; attempt<60 && SECONDS<deadline; attempt++)); do
+    [ "$(kv_meta_inspect "$id" '{{.State.Status}}' 2>/dev/null)" = running ] || break
+    if dsv41_kv_meta_ready; then
+      printf '%s\n' "$conf" | kv_write_file "${conf%/*}/ready"
+      info "Memcache MetaService 就绪: ${name}，指标端口 $DSV41_KV_METRICS_PORT"
+      return 0
+    fi
+    sleep 1
+  done
+  die "MetaService $name 未就绪（60 秒内），请查看 docker logs $name"
+}
+
+kv_meta_down() {
+  local name="$DSV41_CONTAINER-mmc-meta" id owner
+  if id=$(kv_meta_inspect "$name" '{{.Id}}' 2>/dev/null); then
+    owner=$(kv_meta_inspect "$id" '{{index .Config.Labels "io.dsv41.kv.owner"}}')
+    if [ "$owner" != "$DSV41_PROJECT_ROOT:$DSV41_INSTANCE_ID" ]; then
+      warn "跳过其它实例的 MetaService $name"
+      return 0
+    fi
+    "$DSV41_DOCKER_BIN" rm -f "$id" >/dev/null
+  fi
+  rm -f "$DSV41_RESULTS/kv/$DSV41_CONTAINER/ready"
 }
 
 # ---- docker run argument assembly ------------------------------------------
@@ -212,9 +296,10 @@ cmd_shell() {
 }
 
 cmd_up() {
+  dsv41_kv_validate
   need_docker
   "$DSV41_DOCKER_BIN" image inspect "$DSV41_IMAGE" >/dev/null 2>&1 \
-    || die "本机没有镜像 $DSV41_IMAGE（离线环境请先 docker load -i <镜像.tar>）"
+    || die "本机没有镜像 ${DSV41_IMAGE}（离线环境请先 docker load -i <镜像.tar>）"
   [ -f "$DSV41_MODEL/config.json" ] || die "找不到模型: $DSV41_MODEL/config.json"
 
   local state
@@ -245,6 +330,9 @@ cmd_up() {
   local want have
   want=$("$DSV41_DOCKER_BIN" image inspect -f '{{.Id}}' "$DSV41_IMAGE" 2>/dev/null || true)
   have=$("$DSV41_DOCKER_BIN" inspect -f '{{.Image}}' "$DSV41_CONTAINER" 2>/dev/null || true)
+  if [ "$DSV41_KV_OFFLOAD" = 1 ] && { [ -z "$want" ] || [ "$want" != "$have" ]; }; then
+    die "KV offload 需要推理容器使用本机 $DSV41_IMAGE 的镜像 ID；请先核对镜像并 recreate"
+  fi
   if [ -n "$want" ] && [ "$want" != "$have" ]; then
     warn "容器所用镜像与本机 $DSV41_IMAGE 不一致；如需切换请 recreate"
   fi
@@ -253,13 +341,16 @@ cmd_up() {
   head=$("$DSV41_DOCKER_BIN" exec "$DSV41_CONTAINER" git -C /vllm-workspace/vllm-ascend rev-parse HEAD 2>/dev/null || true)
   case "$head" in
     "$DSV41_EXPECT_VLLM_ASCEND_COMMIT"*) info "vllm-ascend 提交 ${head:0:9} 与补丁基线一致" ;;
-    *) warn "容器内 vllm-ascend 提交为 '${head:-unknown}'，补丁基线为 $DSV41_EXPECT_VLLM_ASCEND_COMMIT；apply_patches.sh 可能冲突" ;;
+    *) warn "容器内 vllm-ascend 提交为 '${head:-unknown}'，补丁基线为 ${DSV41_EXPECT_VLLM_ASCEND_COMMIT}；apply_patches.sh 可能冲突" ;;
   esac
 
   if [ "$DSV41_SKIP_PATCHES" != "1" ]; then
     info "应用补丁（幂等）"
     "$DSV41_DOCKER_BIN" exec -e DSV41_ROOTFS=/ -w "$DSV41_PROJECT_ROOT" "$DSV41_CONTAINER" \
       bash "$SELF_DIR/apply_patches.sh" apply
+  fi
+  if [ "$DSV41_KV_OFFLOAD" = 1 ]; then
+    kv_meta_up "$want"
   fi
   info "✅ 容器就绪: $DSV41_CONTAINER"
 }
@@ -268,10 +359,11 @@ cmd_down() {
   need_docker
   if [ -z "$(container_state)" ]; then
     info "容器 $DSV41_CONTAINER 不存在"
-    return 0
+  else
+    info "停止容器 ${DSV41_CONTAINER}（容器内的 vLLM / router 会随之终止；其它容器和进程不受影响）"
+    "$DSV41_DOCKER_BIN" stop -t 30 "$DSV41_CONTAINER" >/dev/null
   fi
-  info "停止容器 $DSV41_CONTAINER（容器内的 vLLM / router 会随之终止；其它容器和进程不受影响）"
-  "$DSV41_DOCKER_BIN" stop -t 30 "$DSV41_CONTAINER" >/dev/null
+  kv_meta_down
 }
 
 cmd_recreate() {
@@ -280,6 +372,7 @@ cmd_recreate() {
     info "删除容器 $DSV41_CONTAINER"
     "$DSV41_DOCKER_BIN" rm -f "$DSV41_CONTAINER" >/dev/null
   fi
+  kv_meta_down
   cmd_up
 }
 

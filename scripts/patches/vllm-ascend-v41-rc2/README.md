@@ -39,7 +39,13 @@ warning while the gate evaluates to `0`).
 | File | Reason |
 |------|--------|
 | `0003-dsa-v1-o-proj-2d.patch` | V4.1 uses `AscendDSAV41Impl`; `dsa_v1.AscendDSAImpl._wo_a_bmm` is not executed |
-| `0101-kvpool-mrv2-resume.patch` | Requires `--kv-transfer-config`; this deployment does not attach an external KV pool |
+
+## KV pool correctness patch
+
+`0101-kvpool-mrv2-resume.patch` clears the preemption marker when MRV2 resumes
+with a full block table. Later scheduler steps can then append block deltas
+without replacing the table and writing incorrect KV under a pool key.
+The Docker offload launcher checks the imported scheduler for this fix.
 
 ## Usage
 

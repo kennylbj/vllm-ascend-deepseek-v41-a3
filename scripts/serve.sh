@@ -26,6 +26,8 @@ set -Eeuo pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 . "$SELF_DIR/common.sh"
+# shellcheck source=kv_offload.sh
+. "$SELF_DIR/kv_offload.sh"
 
 # ---- tunables (override via environment or config/*.env) --------------------
 : "${DSV41_MAX_MODEL_LEN:=360448}"                # 2816 x 128 (block-aligned)
@@ -335,6 +337,52 @@ if [ -n "${DSV41_EXTRA_SERVE_ARGS// /}" ]; then
   ARGS+=("${EXTRA[@]}")
 fi
 
+if [ "${ROUTER_RESTART:-0}" != "1" ]; then
+  dsv41_kv_validate
+  if [ "$DSV41_KV_OFFLOAD" = "1" ]; then
+    for arg in "${ARGS[@]}"; do
+      case "$arg" in
+        --kv-transfer-config|--kv-transfer-config=*|--kv-offloading-size|--kv-offloading-size=*|--no-enable-prefix-caching|--swa-bounded-replay)
+          dsv41_kv_error "KV offload 与额外参数 $arg 冲突"
+          ;;
+      esac
+    done
+    kv_conf=$(dsv41_kv_config_dir)
+    if [ "$(cat "${kv_conf%/*}/ready" 2>/dev/null || true)" != "$kv_conf" ] ||
+       ! dsv41_kv_configs_match "$kv_conf" || ! dsv41_kv_meta_ready; then
+      dsv41_kv_error "Memcache 配置不匹配或 MetaService 未就绪；请以同一配置运行 container.sh up"
+    fi
+
+    export PYTHONHASHSEED=0
+    export MMC_LOCAL_CONFIG_PATH="$kv_conf/mmc-local.conf"
+    kv_lib=$("$PY" -c '
+from importlib.util import find_spec
+from pathlib import Path
+
+spec = find_spec("memcache_hybrid")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("找不到 memcache_hybrid，请核对离线 A3 镜像")
+print(Path(next(iter(spec.submodule_search_locations))) / "lib")
+')
+    export LD_LIBRARY_PATH="$kv_lib:$LD_LIBRARY_PATH"
+    "$PY" - <<'PY'
+from importlib.metadata import version
+from inspect import getsource
+
+from memcache_hybrid import DistributedObjectStore
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import KVPoolScheduler
+
+resume = getsource(KVPoolScheduler._process_new_request)
+if "self._preempted_req_ids.discard(request.req_id)" not in resume:
+    raise SystemExit("[kv] 缺少 0101-kvpool-mrv2-resume 修复，请运行 container.sh up 应用补丁")
+print(f"[kv] memcache-hybrid {version('memcache-hybrid')}, memfabric-hybrid {version('memfabric-hybrid')}")
+PY
+    KV_TRANSFER_JSON=$(printf '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"backend":"memcache","use_layerwise":false,"lookup_rpc_port":"%s"}}' "$DSV41_PORT")
+    ARGS+=(--kv-transfer-config "$KV_TRANSFER_JSON")
+    echo "[kv] host_shm DRAM=${DSV41_KV_DRAM_GIB_PER_WORKER}GiB/worker，metrics=127.0.0.1:$DSV41_KV_METRICS_PORT"
+  fi
+fi
+
 # ---- launch ----------------------------------------------------------------
 echo "[serve] runtime=$DSV41_RUNTIME ROOTFS=$DSV41_ROOTFS instance=$DSV41_INSTANCE_ID offline=$DSV41_OFFLINE"
 echo "[serve] model=$DSV41_MODEL tp=$DSV41_TP dp=$DSV41_DP port=$DSV41_PORT served=$DSV41_SERVED_NAME"
@@ -379,7 +427,7 @@ nohup "$PY" -m vllm.entrypoints.cli.main "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
 cpid=$!
 disown 2>/dev/null || true
 echo "$cpid" > "$DSV41_SERVE_PID_FILE"
-echo "[serve] 已提交 pid=$cpid，run_id=$RUN_ID"
+echo "[serve] 已提交 pid=${cpid}，run_id=$RUN_ID"
 if [ "$DSV41_LB_MODE" = "external" ]; then
   start_router
   echo "[serve] DP supervisor health: curl --noproxy '*' http://127.0.0.1:$DSV41_DP_SUPERVISOR_PORT/health"

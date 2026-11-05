@@ -82,10 +82,12 @@ scripts/patches/vllm-ascend-v41-rc2/
 | 补丁 | 移除原因 |
 |---|---|
 | `0003-dsa-v1-o-proj-2d.patch` | V4.1 使用 `AscendDSAV41Impl`，不执行 `dsa_v1.AscendDSAImpl._wo_a_bmm` |
-| `0101-kvpool-mrv2-resume.patch` | 当前 serve 命令未挂 `--kv-transfer-config`，没有执行路径 |
 
-如果将来启用外部 KV 池（`--kv-transfer-config`），需要重新评估 `0101`：
-缺它时抢占恢复可能把池 key 关联到错误 block，属于静默正确性问题。
+### Memcache KV 池补丁
+
+`0101-kvpool-mrv2-resume.patch` 已加入补丁序列。MRV2 恢复请求时会提交完整的 block 表。
+补丁在此时清除抢占标记，避免后续增量覆盖完整的表，将池 key 关联到错误的 KV。
+Docker offload 启动时会检查实际导入的调度器是否包含此修复。
 
 ---
 
