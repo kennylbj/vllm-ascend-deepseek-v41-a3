@@ -23,14 +23,14 @@ class KVOffloadTest(unittest.TestCase):
         model = self.base / "model"
         model.mkdir()
         (model / "config.json").write_text("{}")
-        self.conf = self.base / "logs/kv/dsv41-test/host_shm-5100-6100-8100-2"
+        self.conf = self.base / "logs/kv/dsv41-test/host_shm-5100-6100-8100-8"
         self.calls = self.base / "docker.log"
         self.sidecar = self.base / "sidecar.json"
         self.env = clean_env(
             DSV41_RUNTIME="docker", DSV41_CONTAINER="dsv41-test",
             DSV41_DOCKER_BIN=str(self.bin / "docker"), DSV41_MODEL=str(model),
             DSV41_RESULTS=str(self.base / "logs"), DSV41_PID_DIR=str(self.base / "run"),
-            DSV41_KV_OFFLOAD="1", DSV41_SKIP_PATCHES="1", DSV41_API_KEY="", MOCK_DIR=str(self.base),
+            DSV41_SKIP_PATCHES="1", DSV41_API_KEY="", MOCK_DIR=str(self.base),
             PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
         )
         self.stub("docker", f"#!{sys.executable}\n" + """
@@ -87,16 +87,20 @@ elif args[0] == "rm":
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_disabled_does_not_create_pool(self):
-        self.assert_ok(self.container(DSV41_KV_OFFLOAD="0"))
-        self.assertNotIn("mmc-meta", self.calls.read_text())
-        self.assertFalse(self.conf.exists())
+        for overrides in ({"DSV41_KV_OFFLOAD": "0"}, {"DSV41_RUNTIME": "native"},
+                          {"DSV41_USE_V2": "0"}, {"DSV41_ENABLE_PREFIX_CACHING": "0"}):
+            with self.subTest(**overrides):
+                self.assert_ok(self.container(**overrides))
+                self.assertNotIn("mmc-meta", self.calls.read_text())
+                self.assertFalse(self.conf.exists())
 
     def test_up_reuses_matching_pool_and_down_cleans_it_after_vllm(self):
         self.assert_ok(self.container())
         self.assert_ok(self.container())
         config = (self.conf / "mmc-local.conf").read_text()
         for value in ("127.0.0.1:5100", "127.0.0.1:6100", "protocol = host_shm",
-                      "dram.size = 2GB", "hbm.size = 0GB", "storage.enabled = false"):
+                      "local_service.dram.size = 8GB", "local_service.max.dram.size = 8GB",
+                      "hbm.size = 0GB", "storage.enabled = false"):
             self.assertIn(value, config)
         self.assertEqual((self.conf.parent / "ready").read_text().strip(), str(self.conf))
         self.assertEqual(self.calls.read_text().count("run -d --pull=never"), 1)

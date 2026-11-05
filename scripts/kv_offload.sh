@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # Shared configuration for the Docker host launcher and the serving container.
 
-: "${DSV41_KV_OFFLOAD:=0}"
-: "${DSV41_KV_DRAM_GIB_PER_WORKER:=2}"
+dsv41_kv_supported() {
+  [ "$DSV41_RUNTIME" = docker ] && [ "${DSV41_USE_V2:-1}" = 1 ] &&
+    [ "${DSV41_ENABLE_PREFIX_CACHING:-1}" = 1 ]
+}
+
+if dsv41_kv_supported; then
+  : "${DSV41_KV_OFFLOAD:=1}"
+else
+  : "${DSV41_KV_OFFLOAD:=0}"
+fi
+: "${DSV41_KV_DRAM_GIB_PER_WORKER:=8}"
 : "${DSV41_KV_META_PORT:=5100}"
 : "${DSV41_KV_STORE_PORT:=6100}"
 : "${DSV41_KV_METRICS_PORT:=8100}"
@@ -19,8 +28,7 @@ dsv41_kv_validate() {
     1) ;;
     *) dsv41_kv_error 'DSV41_KV_OFFLOAD 必须为 0 或 1'; return 1 ;;
   esac
-  if [ "$DSV41_RUNTIME" != docker ] || [ "${DSV41_USE_V2:-1}" != 1 ] \
-     || [ "${DSV41_ENABLE_PREFIX_CACHING:-1}" != 1 ]; then
+  if ! dsv41_kv_supported; then
     dsv41_kv_error 'KV offload 需要 Docker、Model Runner V2 和本地前缀缓存'
     return 1
   fi

@@ -16,7 +16,7 @@
 # apply_patches.sh) run inside, through `docker exec`.
 #
 # Usage:
-#   bash scripts/container.sh up          # create/start + apply patches + optional Memcache
+#   bash scripts/container.sh up          # create/start + apply patches + Memcache by default
 #   bash scripts/container.sh status
 #   bash scripts/container.sh exec [--] <cmd...>   # run a command inside
 #   bash scripts/container.sh shell

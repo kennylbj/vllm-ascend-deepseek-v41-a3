@@ -111,6 +111,8 @@ vi config/dsv41.local.env
 | `DSV41_PID_DIR` | `/run/dsv41` | **必须是专用目录，不能是 `/tmp`** |
 | `DSV41_MAX_MODEL_LEN` | `360448` | 默认上下文长度，见第 10 节 |
 | `DSV41_GPU_MEM_UTIL` | `0.92` | 每个 die 需要的空闲 HBM 占比 |
+| `DSV41_KV_OFFLOAD` | `1` | Docker 预设启用 Memcache DRAM KV offload |
+| `DSV41_KV_DRAM_GIB_PER_WORKER` | `8` | DP2/TP8 共 128 GiB，见第 10 节的内存预算 |
 | `DSV41_DOCKER_PRIVILEGED` | `1` | `--privileged`；设 0 退回显式 `--device` + 放宽 seccomp（备用，未充分实测） |
 | `DSV41_CLEAN_ALL_VLLM` | `0` | 保持 0：只清理本部署进程 |
 
@@ -122,13 +124,14 @@ vi config/dsv41.local.env
 
 ```bash
 bash scripts/container.sh print-cmd     # 只打印 docker run 命令，先过目
-bash scripts/container.sh up            # 创建/启动容器，并应用 4 个补丁（幂等）
+bash scripts/container.sh up            # 创建/启动容器、应用补丁、启动 Memcache MetaService
 bash scripts/container.sh status
 ```
 
 `up` 做的事：检查镜像和模型 → `docker run -d --name dsv41 --init --restart unless-stopped …`
 → 等容器可 exec → 核对镜像一致性与 vllm-ascend 提交（应为 `8fde6d4e3`）→
-`apply_patches.sh apply`。典型输出末尾为 `✅ 容器就绪: dsv41`。
+`apply_patches.sh apply` → 启用 KV offload 时启动并检查 MetaService。典型输出末尾为
+`✅ 容器就绪: dsv41`。
 
 挂载清单（宿主路径存在才挂，缺失的可选项会打印 `⚠ 跳过不存在的挂载源`）：
 
@@ -337,21 +340,29 @@ router，以及带这个标记的进程：
 
 ---
 
-### 可选 Memcache DRAM KV offload
+### Memcache DRAM KV offload
 
-先用 `DSV41_KV_OFFLOAD=0` 建立基线，确认客户端使用 `model=dsv41`，并从启动日志记录各
-DP engine 的 `NPU KV cache size`。本功能复用已有前缀，执行中的请求仍需要 NPU KV 空间。
+Docker 预设默认启用 KV offload，要求 Model Runner V2 和本地前缀缓存。复用已有前缀时从
+DRAM 加载 KV，执行中的请求仍需要 NPU KV 空间。
 
-1. 在目标机确认本地推理容器与 `DSV41_IMAGE` 使用相同镜像 ID。记录 Engram 和模型加载后的
-   `MemAvailable`、`df -h /dev/shm`，以及 `docker inspect -f '{{.HostConfig.Memory}}' dsv41`。
-   默认 `DSV41_KV_DRAM_GIB_PER_WORKER=2`，DP2/TP8 名义上需要 32 GiB DRAM，另需保留运行余量。
+**内存预算。** 目标机共有 1020 GiB。历史启动日志中，两张 Engram 表各约 12.87 GiB/TP
+分片，两个本机 DP 共享 8 个分片，估算约占 206 GiB。KV 池按 16 个 worker 各 8 GiB
+配置，名义容量为 128 GiB。扣除两者后约有 686 GiB 可供模型加载、权重页缓存、系统和
+运行时使用，实际余量以目标机测量为准。
+
+1. 首次上线前可用 `DSV41_KV_OFFLOAD=0` 跑基线。在目标机确认推理容器与 `DSV41_IMAGE`
+   使用相同镜像 ID，确认客户端使用 `model=dsv41`，并从启动日志记录各 DP engine 的
+   `NPU KV cache size`。模型与 Engram 加载后，建议在代表性负载下确认宿主 `MemAvailable`
+   仍至少有 256 GiB（128 GiB 池容量加 128 GiB 余量）。同时检查 `df -h /dev/shm`，以及
+   `docker inspect -f '{{.HostConfig.Memory}}' dsv41` 显示的容器内存限额。
 2. 在维护窗口停止 watchdog，再执行 `bash scripts/container.sh down`。在实际使用的环境文件
-   （例如 systemd 的 `/etc/dsv41.env`）设 `DSV41_KV_OFFLOAD=1`，然后按原入口启动。
+   （例如 systemd 的 `/etc/dsv41.env`）检查 `DSV41_KV_OFFLOAD=1` 和
+   `DSV41_KV_DRAM_GIB_PER_WORKER=8`，旧配置里的显式值会覆盖脚本默认值。然后按原入口启动。
    手动启动依次运行 `bash scripts/container.sh up` 和 `bash scripts/serve.sh`，两次使用同一配置。
    systemd 启动会执行这两个步骤。配置目录位于 `${DSV41_RESULTS}/kv/${DSV41_CONTAINER}/`。
 3. 从服务日志核对 16 个 worker 注册容量，并用
    `curl --noproxy '*' -fsS http://127.0.0.1:8100/metrics` 核对
-   `memcache_total_capacity_bytes` 约为 32 GiB。默认 5100 / 6100 / 8100 分别为 MetaService、
+   `memcache_total_capacity_bytes` 约为 128 GiB。默认 5100 / 6100 / 8100 分别为 MetaService、
    config store 和 metrics 端口。发生冲突时通过 Docker 环境模板中的 `DSV41_KV_*_PORT` 改端口。
    若启动失败，查看 `docker logs dsv41-mmc-meta` 和启动器日志。
 
