@@ -5,8 +5,8 @@ DP2/TP8、Model Runner V2、DSpark K=5、FULL_DECODE_ONLY、1M 上下文上限�
 `--max-num-batched-tokens 16384`、6 个优化 gate、
 `HCCL_OP_EXPANSION_MODE=AIV`、jemalloc、external LB + prefix router。
 
-> **默认批次已改为 8192**（`DSV41_MAX_NUM_BATCHED_TOKENS`）。本文第 1–6 节的吞吐与
-> 显存数据都是在 **16384** 批次下采集的，没有在 8192 下重测；要复现这些表请显式设
+> **默认批次为 4096**（`DSV41_MAX_NUM_BATCHED_TOKENS`）。本文第 1–6 节的吞吐与
+> 显存数据都是在 **16384** 批次下采集的，没有在 4096 下重测；要复现这些表请显式设
 > `DSV41_MAX_NUM_BATCHED_TOKENS=16384`。改默认的依据见第 7 节（生产日志：DP lockstep 下
 > 大 prefill 分块拖慢两个 rank 的 decode）。
 
@@ -169,13 +169,13 @@ DSV41_MAX_MODEL_LEN=262144 bash scripts/serve.sh
 
 | `max-num-batched-tokens` | 峰值激活 | KV cache | KV tokens / DP rank | 1M 上下文并发 |
 |---:|---:|---:|---:|---:|
-| **8192（当前默认）** | ≈4.1 GiB | ≈9.7 GiB | 2,091,049 | 1.99× |
+| **8192（历史配置）** | ≈4.1 GiB | ≈9.7 GiB | 2,091,049 | 1.99× |
 | 16384（本文基准数据的口径） | ≈8.2 GiB | ≈6.7 GiB | 1,268,538 | 1.21× |
 | 32768（未采用） | ≈16.4 GiB（线性外推） | 预算为负 | < 1M | 无法满足 1M 上下文 |
 
 32768 要让总占用回到 55.15 GiB 预算内，必须把 `max-model-len` 降到约 512K；
 如果坚持 1M 上下文，**不要开 32768**。16384 是 1M 上下文下能保住的最大批次；
-默认取 8192 是为了缩短 DP lockstep 下的 decode 停顿并多留 KV（第 7 节）。
+当时选用 8192 是为了缩短 DP lockstep 下的 decode 停顿并多留 KV（第 7 节）。
 
 ### 图桶
 
@@ -279,7 +279,7 @@ rank（两个 rank 同时 prefill 时，一个停顿窗口推进的 prompt KV �
 时的 2.6 倍，而 decode 输出同样被拖慢）。不能：消除 lockstep 本身。若这些都不够，剩下的是
 架构层面的选择（例如单引擎 TP16、或 prefill/decode 分离），不在本仓库范围。
 
-### 默认批次改为 8192，以及如何验证
+### 历史批次调整与验证
 
 停顿步的时长与 prefill 分块大小成正比；同时 8192 比 16384 少占约 4 GiB/die 激活
 （见第 4 节），其中大部分变成 KV（第 4 节实测 6.7 → 9.7 GiB/die，1M 上下文口径）。

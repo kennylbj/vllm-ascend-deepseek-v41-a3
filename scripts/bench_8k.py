@@ -135,7 +135,7 @@ async def run_level(base_url: str, model: str, prompt: str, max_tokens: int, con
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.environ.get("DSV41_BASE_URL", "http://127.0.0.1:8021"))
-    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "DeepSeek-V4.1-Flash-1017"))
+    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "dsv41"))
     parser.add_argument("--api-key", default=(os.environ.get("DSV41_API_KEY") or os.environ.get("DSV41_W8A8_API_KEY")
                         or os.environ.get("API_KEY", "")))
     parser.add_argument("--concurrency", default="1,4,8,16")

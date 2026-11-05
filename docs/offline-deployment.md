@@ -110,7 +110,7 @@ vi config/dsv41.local.env
 | `DSV41_RESULTS` / `DSV41_LOG_DIR` | `/data/dsv41/logs` | 服务 / router / watchdog 日志 |
 | `DSV41_PID_DIR` | `/run/dsv41` | **必须是专用目录，不能是 `/tmp`** |
 | `DSV41_MAX_MODEL_LEN` | `360448` | 默认上下文长度，见第 10 节 |
-| `DSV41_GPU_MEM_UTIL` | `0.90` | 每个 die 需要的空闲 HBM 占比 |
+| `DSV41_GPU_MEM_UTIL` | `0.92` | 每个 die 需要的空闲 HBM 占比 |
 | `DSV41_DOCKER_PRIVILEGED` | `1` | `--privileged`；设 0 退回显式 `--device` + 放宽 seccomp（备用，未充分实测） |
 | `DSV41_CLEAN_ALL_VLLM` | `0` | 保持 0：只清理本部署进程 |
 
@@ -244,7 +244,7 @@ python3 - <<'PY'
 import json, os, urllib.request
 base = "http://127.0.0.1:8021"
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-body = {"model": "DeepSeek-V4.1-Flash-1017",
+body = {"model": "dsv41",
         "messages": [{"role": "system", "content": "请阅读以下内容。" * 400},
                      {"role": "user", "content": "用一句话回答：1+1 等于几？"}],
         "max_tokens": 64, "temperature": 0}
@@ -372,7 +372,7 @@ bash scripts/container.sh status
 | `serve.sh` 报 `容器 dsv41 未运行` | 容器停了 | `bash scripts/container.sh up` |
 | 改了挂载没生效 | 容器参数创建时固化 | `bash scripts/container.sh recreate` |
 | watchdog 反复重启 | 服务确定性启动失败 | `watchdog.sh stop` 后 `serve.sh run` 看完整错误 |
-| 请求 401 / 404 | 缺 Bearer / `model` 名不一致 | 带 `Authorization`；`model` 必须是 `DeepSeek-V4.1-Flash-1017` |
+| 请求 401 / 404 | 缺 Bearer / `model` 名不一致 | 带 `Authorization`；`model` 必须是 `dsv41` |
 | Ctrl-C 没停掉 `serve.sh run` | 非交互 TTY 下 docker exec 不转发信号 | 交互终端里运行（自动 `-it`），或另开终端 `STOP=1 bash scripts/serve.sh` |
 
 更多通用问题见 [`troubleshooting.md`](troubleshooting.md)（含 docker 运行时专节 4b）。
@@ -387,7 +387,7 @@ bash scripts/container.sh status
 - [ ] **Gate 1**：`make probe` → `npu_count 16`
 - [ ] `apply_patches.sh verify` 显示 6 个 gate 默认值均为 1；`doctor.sh` 无 ❌
 - [ ] 旧模型已由你手动停止，HBM 已释放，端口空闲
-- [ ] **Gate 2**：`/health` = 200，`/v1/models` 列出 `DeepSeek-V4.1-Flash-1017`
+- [ ] **Gate 2**：`/health` = 200，`/v1/models` 列出 `dsv41`
 - [ ] **Gate 3**：`tests/smoke_test.py` PASS；`usage.prompt_tokens_details.cached_tokens` 在重复前缀上 > 0
 - [ ] watchdog / systemd 已启用，重启宿主演练通过
 - [ ] 服务只监听内网；防火墙（当前 firewalld 未运行）按需放行 8021

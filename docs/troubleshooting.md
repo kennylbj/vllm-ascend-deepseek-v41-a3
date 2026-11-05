@@ -34,7 +34,7 @@ tail -n 200 logs/serve_*.log
 |---|---|---|
 | `/health` 长期非 200，但进程存活 | 引擎仍在初始化/捕获图 | 等待；首次约 6 分钟。超过 180 s 由 watchdog 宽限 |
 | 请求 401 | 服务启用了 `--api-key`，客户端未带 Bearer | 加 `Authorization: Bearer $DSV41_API_KEY` |
-| 请求 404 `model not found` | `model` 字段与 `--served-model-name` 不一致 | 必须完全一致：`DeepSeek-V4.1-Flash-1017` |
+| 请求 404 `model not found` | `model` 字段与 `--served-model-name` 不一致 | 必须完全一致：`dsv41` |
 | 输出乱码 | `--block-size` 不是 128 | 恢复 `DSV41_BLOCK_SIZE=128` |
 | 推理明显变慢，日志无报错 | gate 静默失效 / 图桶缺失 / draft 回退 eager | `apply_patches.sh verify`；检查图桶含 6N |
 | 日志出现 `Unknown vLLM environment variable` | spawn worker 不继承 env；gate 未固化默认值 | 重新 `apply_patches.sh apply` 并重启 |

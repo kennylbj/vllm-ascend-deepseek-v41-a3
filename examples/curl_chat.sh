@@ -6,7 +6,7 @@
 set -euo pipefail
 
 BASE_URL=${DSV41_BASE_URL:-http://127.0.0.1:8021}
-MODEL=${DSV41_SERVED_NAME:-DeepSeek-V4.1-Flash-1017}
+MODEL=${DSV41_SERVED_NAME:-dsv41}
 API_KEY=${DSV41_API_KEY:-${DSV41_W8A8_API_KEY:-${API_KEY:-}}}
 PROMPT=${1:-"用三句话解释什么是推测解码。"}
 

@@ -19,7 +19,7 @@
 Authorization: Bearer <DSV41_API_KEY>
 ```
 
-模型名必须与 `DSV41_SERVED_NAME` 一致，默认 `DeepSeek-V4.1-Flash-1017`。
+模型名必须与 `DSV41_SERVED_NAME` 一致，默认 `dsv41`。
 路由模式、端口和故障排查见 [`router.md`](router.md)。
 
 ---
@@ -31,7 +31,7 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
   -H "Authorization: Bearer $DSV41_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "DeepSeek-V4.1-Flash-1017",
+    "model": "dsv41",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "介绍一下张量并行。"}
@@ -49,7 +49,7 @@ curl --noproxy '*' -N http://127.0.0.1:8021/v1/chat/completions \
   -H "Authorization: Bearer $DSV41_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "DeepSeek-V4.1-Flash-1017",
+    "model": "dsv41",
     "messages": [{"role": "user", "content": "写一首关于秋天的五言绝句"}],
     "max_tokens": 256,
     "stream": true
@@ -74,7 +74,7 @@ client = OpenAI(
 )
 
 resp = client.chat.completions.create(
-    model="DeepSeek-V4.1-Flash-1017",
+    model="dsv41",
     messages=[{"role": "user", "content": "你好"}],
     max_tokens=256,
     temperature=0,
@@ -148,7 +148,7 @@ CLIProxyAPI 与 `reasoning_proxy.py` 属于外部组件，不在本仓库内。�
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_API_KEY=<CLIProxyAPI 的 key>
 
-claude --model DeepSeek-V4.1-Flash-1017 -p "你好"
+claude --model dsv41 -p "你好"
 ```
 
 ---
@@ -158,7 +158,7 @@ claude --model DeepSeek-V4.1-Flash-1017 -p "你好"
 只要支持自定义 `baseURL` + Bearer token 即可，例如：
 
 - **OpenCode / Cline / Continue**：provider 选 OpenAI-compatible，
-  `baseURL = http://<host>:8021/v1`，`model = DeepSeek-V4.1-Flash-1017`；
+  `baseURL = http://<host>:8021/v1`，`model = dsv41`；
 - **LangChain**：`ChatOpenAI(base_url=..., api_key=..., model=...)`；
 - **OpenAI-compatible 网关**（LiteLLM 等）：同上。
 
@@ -174,7 +174,7 @@ keepalive 代理以复用长连接；这是纯客户端优化，不属于服务�
 
 ```json
 {
-  "model": "DeepSeek-V4.1-Flash-1017",
+  "model": "dsv41",
   "messages": [{"role": "user", "content": "北京现在天气如何？"}],
   "tools": [{
     "type": "function",

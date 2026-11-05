@@ -9,7 +9,7 @@ Checks:
 Usage:
     python3 tests/smoke_test.py
     python3 tests/smoke_test.py --base-url http://127.0.0.1:8021 \
-        --model DeepSeek-V4.1-Flash-1017 --api-key "$DSV41_API_KEY"
+        --model dsv41 --api-key "$DSV41_API_KEY"
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def request(url: str, headers: dict[str, str], payload: dict | None = None) -> t
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.environ.get("DSV41_BASE_URL", "http://127.0.0.1:8021"))
-    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "DeepSeek-V4.1-Flash-1017"))
+    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "dsv41"))
     parser.add_argument("--api-key", default=(os.environ.get("DSV41_API_KEY") or os.environ.get("DSV41_W8A8_API_KEY")
                         or os.environ.get("API_KEY", "")))
     parser.add_argument("--max-tokens", type=int, default=1024)

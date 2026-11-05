@@ -55,7 +55,7 @@ unset _dsv41_cfg _dsv41_env_backup
 # ---- service ---------------------------------------------------------------
 : "${DSV41_PORT:=8021}"
 : "${DSV41_HOST:=0.0.0.0}"
-: "${DSV41_SERVED_NAME:=DeepSeek-V4.1-Flash-1017}"
+: "${DSV41_SERVED_NAME:=dsv41}"
 : "${DSV41_DP:=2}"
 : "${DSV41_TP:=8}"
 

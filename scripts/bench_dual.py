@@ -17,6 +17,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import asyncio
 import json
 import os
@@ -100,7 +101,7 @@ async def run_level(base_url, model, prompts, max_tokens, concurrency, headers, 
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8021")
-    ap.add_argument("--model", default="DeepSeek-V4.1-Flash-1017")
+    ap.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "dsv41"))
     ap.add_argument("--api-key", default=os.environ.get("DSV41_API_KEY", ""))
     ap.add_argument("--concurrency", default="2,4,8,16,32")
     ap.add_argument("--max-tokens", type=int, default=256)

@@ -40,7 +40,7 @@ Usage:
         --upstream http://127.0.0.1:8023 \
         --kv-events tcp://127.0.0.1:5557 \
         --kv-events tcp://127.0.0.1:5558 \
-        --model DeepSeek-V4.1-Flash-1017
+        --model dsv41
 """
 
 from __future__ import annotations

@@ -29,9 +29,9 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # ---- tunables (override via environment or config/*.env) --------------------
 : "${DSV41_MAX_MODEL_LEN:=360448}"                # 2816 x 128 (block-aligned)
-: "${DSV41_MAX_NUM_BATCHED_TOKENS:=8192}"        # DP2+EP lockstep: smaller prefill chunk = shorter decode stall
+: "${DSV41_MAX_NUM_BATCHED_TOKENS:=4096}"        # DP2+EP lockstep: smaller prefill chunk = shorter decode stall
 : "${DSV41_MAX_NUM_SEQS:=32}"
-: "${DSV41_GPU_MEM_UTIL:=0.9}"
+: "${DSV41_GPU_MEM_UTIL:=0.92}"
 : "${DSV41_BLOCK_SIZE:=128}"
 : "${DSV41_SPEC_TOKENS:=5}"
 : "${DSV41_USE_V2:=1}"

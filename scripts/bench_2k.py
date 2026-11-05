@@ -12,7 +12,7 @@ decoding, streaming. This mirrors the reference numbers in docs/performance.md.
 Usage:
     python3 scripts/bench_2k.py
     python3 scripts/bench_2k.py --base-url http://127.0.0.1:8021 \
-        --model DeepSeek-V4.1-Flash-1017 --concurrency 1,4,8,16,32
+        --model dsv41 --concurrency 1,4,8,16,32
 
 API key: --api-key or DSV41_API_KEY / API_KEY.
 Requires: pip install aiohttp
@@ -116,7 +116,7 @@ async def run_level(base_url: str, model: str, prompt: str, max_tokens: int, con
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.environ.get("DSV41_BASE_URL", "http://127.0.0.1:8021"))
-    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "DeepSeek-V4.1-Flash-1017"))
+    parser.add_argument("--model", default=os.environ.get("DSV41_SERVED_NAME", "dsv41"))
     parser.add_argument("--api-key", default=(os.environ.get("DSV41_API_KEY") or os.environ.get("DSV41_W8A8_API_KEY")
                         or os.environ.get("API_KEY", "")))
     parser.add_argument("--concurrency", default="1,2,4,8,16,32",

@@ -41,7 +41,7 @@
 
 单机 8×910C（DP2/TP8），`completions` 接口，约 2K prompt / 256 output，
 temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**（默认批次现为
-8192，下表未在 8192 下重测），2026-11-02 实测（机器无其它在线流量）：
+4096，下表为历史实测），2026-11-02 实测（机器无其它在线流量）：
 
 | 并发 | 单前缀总吞吐 (tok/s) | 双前缀总吞吐 (tok/s) |
 |---:|---:|---:|
@@ -78,7 +78,7 @@ temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**（�
 | transformers | 5.14.1 |
 | 权重 | `Eco-Tech/DeepSeek-V4.1-Flash-1017-w8a8`，W8A8_DYNAMIC，728 GB / 142 shard |
 | 上下文 | 默认 360,448 tokens（`DSV41_MAX_MODEL_LEN`，可调至 1,048,576） |
-| 服务名 | `DeepSeek-V4.1-Flash-1017`（必须与客户端 `model` 一致） |
+| 服务名 | `dsv41`（必须与客户端 `model` 一致） |
 
 ## 目录结构
 
@@ -192,7 +192,7 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
   -H "Authorization: Bearer $DSV41_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "DeepSeek-V4.1-Flash-1017",
+    "model": "dsv41",
     "messages": [{"role": "user", "content": "你好"}],
     "max_tokens": 128
   }'
@@ -213,7 +213,7 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
   的进程（serve.sh 启动的进程都带 `DSV41_PROC_TAG`，孤儿 worker 也能识别），同机其它
   vLLM / NPU 任务不受影响。只有显式 `DSV41_CLEAN_ALL_VLLM=1`（watchdog/STOP）或
   `kill_vllm.sh --all` 才会清理本机所有 `VLLM::` worker。
-- **NPU 显存**：本服务按 `DSV41_GPU_MEM_UTIL`（默认 0.9）要求每个 die 有足够空闲 HBM。
+- **NPU 显存**：本服务按 `DSV41_GPU_MEM_UTIL`（默认 0.92）要求每个 die 有足够空闲 HBM。
   同机若还有别的模型占着这些 die，需要先停掉，或调低 `DSV41_GPU_MEM_UTIL`。
 
 ## 文档
