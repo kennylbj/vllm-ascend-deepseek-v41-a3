@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
-index 8cd11c8c1..b675a53ef
+index 8cd11c8c1..3869e73c1 100644
 --- a/vllm_ascend/attention/dsa_v41.py
 +++ b/vllm_ascend/attention/dsa_v41.py
 @@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
@@ -87,7 +87,7 @@ index 8cd11c8c1..b675a53ef
      @classmethod
      def get_cudagraph_support(
          cls,
-@@ -977,17 +1026,67 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -977,17 +1026,69 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
              slots = self._slot_mapping[:num_input_tokens]
              flat_slots = None
          else:
@@ -106,27 +106,29 @@ index 8cd11c8c1..b675a53ef
 +            # instead of rebuilding the chain (~3 ``where`` plus
 +            # ``div``/``remainder``/``copy_``) into their own buffer.
 +            skip_ring_update = kwargs.get("skip_ring_state_update", False)
-+            slot_key = f"slot:coordinates:c{ratio}:b{storage_block_size}:s{int(skip_ring_update)}"
++            slot_key = f"slot:coordinates:c{ratio}:b{storage_block_size}:s{int(skip_ring_update)}:t{num_input_tokens}"
 +            # The flat mapping has no physical-block component, so Long KV and
 +            # Indexer builders with the same ratio share it even when their
 +            # storage block sizes differ.
-+            flat_slot_key = f"slot:flat:c{ratio}:s{int(skip_ring_update)}"
++            flat_slot_key = f"slot:flat:c{ratio}:s{int(skip_ring_update)}:t{num_input_tokens}"
              prepared_slots = shared.get(slot_key)
              prepared_flat_slots = shared.get(flat_slot_key)
              if prepared_slots is None or prepared_flat_slots is None:
 -                active_slots = common.slot_mapping[:num_input_tokens]
 -                if self._uses_a5_packed_cache and active_slots.device.type == "npu":
-+                active_key = f"slot:active:c{ratio}"
-+                active_slots = shared.get(active_key)
-+                raw_slots = shared.get("slot:raw")
-+                if raw_slots is None:
-+                    raw_slots = common.slot_mapping[:num_input_tokens]
-+                    shared["slot:raw"] = raw_slots
-+                if active_slots is None:
-+                    active_slots = raw_slots
-+                    if compressed and ratio != 1:
-+                        active_slots = compressed_slot_mapping(active_slots, ratio)
-+                    shared[active_key] = active_slots
++                # ``common.slot_mapping`` is rebuilt by the runner every step
++                # and its slice length is this step's ``num_input_tokens``.
++                # Caching the view (or anything derived from it) hands a later
++                # step a buffer of the wrong length, or a stale carrier
++                # entirely, once the step size or the metadata object changes
++                # -- KV then lands in the wrong block and the output degrades
++                # into garbage. Re-derive them per build; the only value worth
++                # sharing is the finished mapping, and its key carries the
++                # step size in the key above.
++                raw_slots = common.slot_mapping[:num_input_tokens]
++                active_slots = raw_slots
++                if compressed and ratio != 1:
++                    active_slots = compressed_slot_mapping(active_slots, ratio)
 +                if (
 +                    self._triton_slot_mapping
 +                    and raw_slots.device.type == "npu"
@@ -162,7 +164,7 @@ index 8cd11c8c1..b675a53ef
                      assert self._device_backend is not None
                      prepared_slots, prepared_flat_slots = self._device_backend.build_packed_cache_slot_mapping(
                          active_slots,
-@@ -998,36 +1097,65 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -998,36 +1099,63 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                          num_actual_tokens,
                          storage_block_size,
                          ratio if compressed else 1,
@@ -185,23 +187,21 @@ index 8cd11c8c1..b675a53ef
 -                                valid &= positions.remainder(2) == 1
 -                    physical = active_slots.clamp_min(0)
 -                    self._slot_mapping_2d[:num_input_tokens, 0].copy_(
-+                    valid_key = f"slot:valid:c{ratio}:s{int(skip_ring_update)}"
-+                    valid = shared.get(valid_key)
-+                    if valid is None:
-+                        valid = active_slots >= 0
-+                        if compressed and ratio == 2:
-+                            if skip_ring_update:
-+                                valid.zero_()
-+                            else:
-+                                valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
-+                                token_ids = shared.get("slot:arange")
-+                                if token_ids is None:
-+                                    token_ids = torch.arange(num_input_tokens, device=active_slots.device)
-+                                    shared["slot:arange"] = token_ids
-+                                valid &= token_ids < valid_end
-+                                if positions is not None:
-+                                    valid &= positions.remainder(2) == 1
-+                        shared[valid_key] = valid
++                    # ``valid`` and the ``arange`` it is compared against are a
++                    # function of this step's slot mapping and positions, so
++                    # they are rebuilt here instead of cached: a cached mask
++                    # from a step with a different ``num_input_tokens`` would
++                    # silently mark the wrong rows as writable.
++                    valid = active_slots >= 0
++                    if compressed and ratio == 2:
++                        if skip_ring_update:
++                            valid.zero_()
++                        else:
++                            valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
++                            token_ids = torch.arange(num_input_tokens, device=active_slots.device)
++                            valid &= token_ids < valid_end
++                            if positions is not None:
++                                valid &= positions.remainder(2) == 1
 +                    if prepared_slots is None:
 +                        # ``out=`` requires the destination and both operands to
 +                        # agree exactly, whereas ``copy_`` used to convert on the
@@ -217,13 +217,17 @@ index 8cd11c8c1..b675a53ef
 +                        # these run once per KV group per step. Measured on
 +                        # NPU: 5 host ops -> 2, and the column view does not
 +                        # have to be contiguous.
-                         torch.where(
-                             valid,
-                             torch.div(physical, storage_block_size, rounding_mode="floor"),
--                            -1,
++                        torch.where(
++                            valid,
++                            torch.div(physical, storage_block_size, rounding_mode="floor"),
 +                            neg,
 +                            out=self._slot_mapping_2d[:num_input_tokens, 0],
-                         )
++                        )
+-                        torch.where(
+-                            valid,
+-                            torch.div(physical, storage_block_size, rounding_mode="floor"),
+-                            -1,
+-                        )
 -                    )
 -                    self._slot_mapping_2d[:num_input_tokens, 1].copy_(
 -                        torch.where(valid, physical.remainder(storage_block_size), -1)
@@ -250,7 +254,7 @@ index 8cd11c8c1..b675a53ef
                  shared[slot_key] = prepared_slots
                  shared[flat_slot_key] = prepared_flat_slots
              slots = prepared_slots
-@@ -1057,15 +1185,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1057,15 +1190,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                  rope = get_cos_and_sin_dsa(positions, use_cache=(coordinates["num_prefills"] == 0 or full_graph_mode))
                  batch_shared["rope"] = rope
              cos, sin = rope
@@ -271,7 +275,7 @@ index 8cd11c8c1..b675a53ef
          ori_sparse_indices = kwargs.get("ori_sparse_indices")
          ori_topk_length = None
          noncausal = not bool(getattr(common, "causal", True))
-@@ -1236,9 +1360,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1236,9 +1365,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                          batch_size=num_reqs,
                          max_seqlen_q=-1,
                          max_seqlen_k=-1,
@@ -283,7 +287,7 @@ index 8cd11c8c1..b675a53ef
                          topk=index_topk,
                          mask_mode=3,
                          cmp_ratio=ratio,
-@@ -1252,9 +1376,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1252,9 +1381,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
  
                  def build_qli_metadata() -> None:
                      value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
@@ -295,7 +299,7 @@ index 8cd11c8c1..b675a53ef
                          index_topk,
                          2,
                          cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-@@ -1327,26 +1451,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1327,26 +1456,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                  query_lens = ends - starts
                  live = torch.arange(num_reqs, device=starts.device) < num_actual_reqs
                  used = (ends.clamp_max(num_actual_tokens) - starts).clamp_min(0)

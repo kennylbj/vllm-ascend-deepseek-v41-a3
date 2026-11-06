@@ -142,11 +142,11 @@ bash scripts/apply_patches.sh apply
 bash scripts/apply_patches.sh verify
 ```
 
-`apply` 是幂等的：已应用则跳过 `git apply`，但仍会执行 gate 默认值固化。
-`verify` 必须输出：
+`apply` 会预演并安装 vllm-ascend 与 vLLM 两套补丁。安装记录和源码相符时可重复执行。
+`verify` 成功时输出：
 
 ```
-[verify] ✅ 6 个 gate 均已定义且默认值为 1
+[verify] ✅ 补丁记录与源码校验通过
 ```
 
 补丁内容与原理见 [`patches.md`](patches.md)。
@@ -157,8 +157,7 @@ bash scripts/apply_patches.sh verify
 bash scripts/apply_patches.sh revert --force
 ```
 
-> 回滚只恢复补丁涉及的文件到 rootfs 内 git HEAD。若 rootfs 不是 git 工作树，
-> 请重新解包。
+> Git 基线与安装记录一致时，回滚只恢复记录中的文件。非 Git 树、旧版补丁记录或基线变化时，从干净 rootfs 重装。
 
 ---
 
@@ -333,7 +332,7 @@ sudo systemctl status dsv41-watchdog
 | 重建 rootfs | `bash scripts/setup_rootfs.sh --force`，然后重新 `apply_patches.sh apply` |
 | 更换镜像 tag | `TAG=<new> BASE_ROOTFS=<new-dir> bash scripts/setup_rootfs.sh`，补丁可能需要重新生成 |
 | 更新权重 | 替换权重目录，保持路径不变；否则接受一次完整冷启动 |
-| 改补丁 | 编辑 `scripts/patches/...`，删除 `<rootfs>/vllm-workspace/vllm-ascend/.patches-applied` 后重新 apply |
+| 改补丁 | 在同一 Git 基线上先 `revert --force` 再应用新序列，或从干净镜像或 rootfs 重装 |
 | 升级 vllm-ascend | 重新核对补丁上下文；`apply_patches.sh check` 会提前暴露冲突 |
 
 ---
@@ -343,7 +342,7 @@ sudo systemctl status dsv41-watchdog
 - [ ] `npu-smi info` 全部健康，启动前无残留 `VLLMWorker_DP`
 - [ ] 权重 142 个 shard 完整，`config.json` 可读
 - [ ] `setup_rootfs.sh` 校验通过，`.dsv41-image` 记录正确 digest
-- [ ] `apply_patches.sh verify` 显示 6 个 gate 默认值均为 1（含 `model.py`）
+- [ ] `make verify` 确认两个组件的补丁记录、源码和 Ascend gate 默认值一致
 - [ ] `scripts/doctor.sh` 无失败项
 - [ ] `DSV41_API_KEY` 已设置为强随机值
 - [ ] `/health` = 200，`tests/smoke_test.py` PASS

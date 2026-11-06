@@ -224,7 +224,7 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
 | [deployment.md](docs/deployment.md) | 从零到可服务的完整步骤与校验点（rootfs 直跑） |
 | [architecture.md](docs/architecture.md) | rootfs 隔离、DP/TP 进程拓扑、端口与 PID |
 | [performance.md](docs/performance.md) | 实测吞吐、显存模型、每个参数的收益与代价 |
-| [patches.md](docs/patches.md) | 4 个补丁、6 个 gate、为什么默认值必须是 1 |
+| [patches.md](docs/patches.md) | vLLM 与 Ascend 补丁、6 个 gate 和升级验收 |
 | [troubleshooting.md](docs/troubleshooting.md) | 症状 → 原因 → 修复 |
 | [api.md](docs/api.md) | OpenAI 兼容接口、SDK、Claude Code |
 

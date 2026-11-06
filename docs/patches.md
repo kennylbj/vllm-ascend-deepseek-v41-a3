@@ -1,12 +1,7 @@
 # 补丁与优化 gate
 
-本仓库只保留**当前 V4.1 / A3 / V2 路径实际执行**的 4 个补丁。每个补丁都以
-`vllm-ascend v0.30.0rc2`（`8fde6d4e3`，rc2-a3 镜像自带）为基线，并已用
-`git apply --check` 在干净的 rc2 源码树上验证可顺序应用。
-
-> `0002-dsa-v41.patch` 由生产 rootfs 的实际 diff 重新生成（去掉文件 mode 变化），
-> 保证「新部署得到的代码 = 已验证运行的代码」。早期手工编辑的补丁版本与
-> pristine 基线不兼容，已在本次整理中修复。
+rc2-a3 镜像内有两套补丁基线。vllm-ascend 使用 `v0.30.0rc2`（`8fde6d4e3`），
+包含四个优化补丁和已有的 `0101`。vLLM 使用 `ced6857af`，包含一个 tokenizer 修复。
 
 ```
 scripts/patches/vllm-ascend-v41-rc2/
@@ -14,8 +9,13 @@ scripts/patches/vllm-ascend-v41-rc2/
 ├── 0002-dsa-v41.patch
 ├── 0004-model-opts.patch
 ├── 0005-packed-cache-slot-mapping-scalar.patch
+├── 0101-kvpool-mrv2-resume.patch
 ├── series.conf
 └── README.md
+
+scripts/patches/vllm-ced6857af/
+├── 0001-deepseek-v41-encoding-safety.patch
+└── series.conf
 ```
 
 ---
@@ -45,12 +45,8 @@ scripts/patches/vllm-ascend-v41-rc2/
   减少 Python 侧 eager op 链与重复张量操作；
 - 保留原来的 eager 路径作为回退。
 
-该文件含本地修改，是当前生产实际运行的版本。
-
-> `0002` 会在一次 metadata build 内缓存 `raw_slots` / `active_slots` / `valid`
-> 视图（依赖 runner 每次 build 重置 `common_v41_metadata`）。升级 runner 后若
-> 该字典改为跨 step 复用，必须移除这些缓存，否则可能把旧 step 的 slot 视图
-> 带进新 step，导致 KV 写入错误块。升级时请重点复核这一点。
+槽位、有效位掩码和索引由当前 `slot_mapping` 逐次推导。只有最终坐标和 flat mapping
+在同一 runner step 的缓存组内共享，键包含 `num_input_tokens`，避免不同形状复用旧映射。
 
 ### 0004 — 模型与算子微优化
 
@@ -74,6 +70,11 @@ scripts/patches/vllm-ascend-v41-rc2/
 - 顺带修正 int32/int64 比较与 padding 尾部有效性判断。
 
 这是 6N 图桶之外最重要的 decode 侧收益之一。
+
+### vLLM — DeepSeek V4.1 tokenizer
+
+转义消息与工具参数中作为普通文本传入的控制 token。工具参数在 JSON 解码后转义，
+消息和上下文由编码器复制后处理。空正文的 developer 消息仍可渲染所附 tools。
 
 ---
 
@@ -125,8 +126,7 @@ spawn 子进程**不继承父进程的 `os.environ`**：
 验证：
 
 ```bash
-bash scripts/apply_patches.sh verify
-# [verify] ✅ 6 个 gate 均已定义且默认值为 1
+make verify
 ```
 
 ---
@@ -134,20 +134,36 @@ bash scripts/apply_patches.sh verify
 ## 4. 应用 / 回滚机制
 
 ```bash
-bash scripts/apply_patches.sh status    # 是否已应用 + gate 默认值
-bash scripts/apply_patches.sh check     # git apply --check（不改文件）
+bash scripts/apply_patches.sh status    # 报告各组件状态
+bash scripts/apply_patches.sh check     # 只读预演两套补丁
 bash scripts/apply_patches.sh apply     # 应用 + 固化默认值（幂等）
-bash scripts/apply_patches.sh verify    # 校验 6 个 gate
+make verify                            # 校验记录、序列和已部署源码
 bash scripts/apply_patches.sh revert --force
 ```
 
 细节：
 
-- 目标目录默认 `$DSV41_ROOTFS/vllm-workspace/vllm-ascend`，可用 `SRC=` 覆盖；
-- 若目标不是 git 工作树，自动退回 `patch -p1`；但 `revert` 仍需要 git；
-- 应用成功后写入 `.patches-applied`；
-- `apply` 检测到 `envs.py` 已含 gate 名称时跳过重复 `git apply`；
-- 回滚只 `git checkout` 补丁涉及的文件，不影响其它本地改动。
+- 默认管理 `$DSV41_ROOTFS/vllm-workspace/` 下的 `vllm-ascend` 与 `vllm`。
+  用 `SRC` 和 `PATCH_DIR` 调试单组件。
+- 每棵源码树的 `.patches-applied.d/manifest.json` 记录基线、有序补丁 SHA-256 和安装结果。
+  旧 `.done` 只有在 Git 基线与实际源码可验证时才能迁移。已装旧版 `0002` 的实例从干净镜像或 rootfs 重装。
+- 序列变更、源码漂移或 Git 基线变化会使 `make verify` 失败。Git 基线一致时，可用旧记录的文件清单回滚后重装。
+  无 Git 的干净解包树使用 `patch -p1` 安装，回滚通过重新解包完成。
+
+### A3 专项验收
+
+摘流并停止 watchdog 后，重建 Docker 容器或准备干净的 native rootfs。安装后执行
+`make verify` 和 `make probe`，启动服务后执行 `make smoke` 和以下专项测试。
+
+```bash
+DSV41_CONTAINER_SOURCE_ENV=1 bash scripts/container.sh exec -- \
+  env PYTHONPATH=/vllm-workspace/vllm-ascend:/vllm-workspace/vllm \
+  python3 -m unittest discover -s tests/ut -v
+```
+
+native 部署用服务所用的 rootfs Python 和 CANN 环境执行同一个 unittest 命令。测试读取
+`DSV41_BASE_URL`、`DSV41_SERVED_NAME` 和 `DSV41_API_KEY`，覆盖连续 builder 调用、
+tokenizer 及在线 chat 和 tokenize 接口。验收失败时从干净镜像或 rootfs 恢复上一版发布。
 
 ---
 

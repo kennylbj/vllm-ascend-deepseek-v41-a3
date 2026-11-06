@@ -187,7 +187,7 @@ fi
 section "补丁"
 if { [ "$DSV41_RUNTIME" = "docker" ] && [ "$CONTAINER_RUNNING" = 1 ]; } \
    || { [ "$DSV41_RUNTIME" != "docker" ] && [ -f "$DSV41_ROOTFS/vllm-workspace/vllm-ascend/vllm_ascend/envs.py" ]; }; then
-  if bash "$SELF_DIR/apply_patches.sh" status 2>/dev/null | grep -q 'verify.*✅'; then
+  if bash "$SELF_DIR/apply_patches.sh" verify >/dev/null 2>&1; then
     ok "补丁与 gate 默认值正常"
   else
     warn "补丁状态异常，运行 bash scripts/apply_patches.sh status"

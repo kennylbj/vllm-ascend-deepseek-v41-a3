@@ -1,0 +1,109 @@
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -167,7 +167,58 @@
+ 
+ 
+ SYSTEM_SP_TOKEN = "<｜System｜>"
++
++# Split literal control tokens in text before tokenization. Image placeholders
++# retain the tokenizer's existing validation.
++_TURN_BOUNDARY_TOKENS = (
++    bos_token,
++    eos_token,
++    thinking_start_token,
++    thinking_end_token,
++    USER_SP_TOKEN,
++    ASSISTANT_SP_TOKEN,
++    SYSTEM_SP_TOKEN,
++    LATEST_REMINDER_SP_TOKEN,
++    *DS_TASK_SP_TOKENS.values(),
++)
++
++_ESCAPE_MARK = "\u200b"
++
++
++def escape_control_tokens(text: str) -> str:
++    """Neutralize control tokens embedded in free-form text."""
++    for token in _TURN_BOUNDARY_TOKENS:
++        if token in text:
++            text = text.replace(token, token[0] + _ESCAPE_MARK + token[1:])
++    return text
++
++
++def escape_message_control_tokens(msg: dict) -> None:
++    """Escape free-form text in a private copy of the message."""
++    content = msg.get("content")
++    if isinstance(content, str):
++        msg["content"] = escape_control_tokens(content)
++
++    for key in ("reasoning", "reasoning_content"):
++        value = msg.get(key)
++        if isinstance(value, str):
++            msg[key] = escape_control_tokens(value)
+ 
++    for blk in msg.get("content_blocks") or []:
++        if not isinstance(blk, dict):
++            continue
++        if isinstance(blk.get("text"), str):
++            blk["text"] = escape_control_tokens(blk["text"])
++        if blk.get("type") == "tool_result":
++            inner = blk.get("content")
++            if isinstance(inner, str):
++                blk["content"] = escape_control_tokens(inner)
++            elif isinstance(inner, list):
++                for sub in inner:
++                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
++                        sub["text"] = escape_control_tokens(sub["text"])
++
++
+ tool_calls_block_name: str = " calls"
+ tool_call_tag_name: str = " invoke"
+ tool_parameter_tag_name: str = " parameter"
+@@ -281,9 +332,9 @@
+             p_dsml_template.format(
+                 dsml_token=dsml_token,
+                 tool_parameter_tag_name=tool_parameter_tag_name,
+-                key=k,
++                key=escape_control_tokens(str(k)),
+                 is_str="true" if isinstance(v, str) else "false",
+-                value=v if isinstance(v, str) else to_json(v),
++                value=escape_control_tokens(v if isinstance(v, str) else to_json(v)),
+             )
+         )
+ 
+@@ -363,11 +414,9 @@
+             )
+ 
+     elif role == "developer":
+-        assert content, f"Invalid message for role `{role}`: {msg}"
++        # Tools-only developer messages may omit text.
++        content_developer = USER_SP_TOKEN + ("" if content is None else content)
+ 
+-        content_developer = USER_SP_TOKEN
+-        content_developer += content
+-
+         if tools:
+             content_developer += "\n\n" + render_tools(tools)
+         if response_format:
+@@ -539,7 +588,9 @@
+     reasoning_effort: Union[str, int, None] = None,
+ ) -> str:
+     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
+-    context = context if context else []
++    # Sorting tool results mutates messages. Keep the caller's context intact,
++    # just as merge_tool_messages does for messages below.
++    context = copy.deepcopy(context) if context else []
+ 
+     # Preprocess: merge tool messages and sort tool results
+     messages = merge_tool_messages(messages)
+@@ -550,6 +601,9 @@
+ 
+     full_messages = context + messages
+ 
++    for msg in full_messages:
++        escape_message_control_tokens(msg)
++
+     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
+ 
+     # Resolve drop_thinking: if any message has tools defined, don't drop thinking

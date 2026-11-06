@@ -65,7 +65,7 @@ patches:
 	bash $(ROOT)/scripts/apply_patches.sh apply
 
 verify:
-	bash $(ROOT)/scripts/apply_patches.sh status
+	bash $(ROOT)/scripts/apply_patches.sh verify
 
 serve:
 	bash $(ROOT)/scripts/serve.sh
