@@ -15,9 +15,8 @@ request:
                   + sat_penalty    if the rank is KV-saturated or has a queue
 
 and sends the request to the lowest score (policy ``cost``, the default).
-Cached prefix, prefill backlog and KV pressure are all expressed in tokens, so
-a request is only pulled away from the rank holding its prefix when the saving
-is smaller than the cost of waiting there. The previous request-count policy
+A rank above the KV high watermark is bypassed when a healthy rank has
+confirmed headroom for the full input. The previous request-count policy
 (prefix affinity unless the active-request gap exceeds --max-skew) is kept as
 ``--policy legacy``.
 
@@ -100,6 +99,10 @@ _METRIC_LINE = re.compile(
     r"^(vllm:kv_cache_usage_perc|vllm:num_requests_waiting|vllm:num_requests_running)"
     r"(?:\{[^}]*\})?\s+([-+0-9.eE]+|NaN|nan)\s*$"
 )
+_METRIC_SAMPLE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{((?:[^"{}]|"(?:\\.|[^"\\])*")*)\})?([ \t]+.*)$'
+)
+_METRIC_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"')
 
 
 def block_digest(previous: bytes, tokens: list[int]) -> bytes:
@@ -118,14 +121,24 @@ def prefix_digests(tokens: list[int], block_size: int = BLOCK_SIZE) -> list[byte
 
 
 def parse_load_metrics(text: str) -> dict[str, float]:
-    """Pull KV usage (0-1), queue depth and running count out of Prometheus text.
+    """Pull KV usage, capacity, queue depth and running count from Prometheus text.
 
-    The /metrics of one API server only describes its own engine, but if several
-    series are present the largest value wins (the conservative reading).
+    If several series are present, use the highest load and smallest capacity.
     """
     out: dict[str, float] = {}
     for line in text.splitlines():
         if not line.startswith("vllm:"):
+            continue
+        if line.startswith("vllm:cache_config_info{"):
+            sample = _METRIC_SAMPLE.match(line)
+            if sample:
+                labels = dict(_METRIC_LABEL.findall(sample[2]))
+                try:
+                    capacity = int(labels.get("kv_cache_size_tokens", "0"))
+                except ValueError:
+                    continue
+                if capacity > 0:
+                    out["kv_cache_size_tokens"] = min(out.get("kv_cache_size_tokens", capacity), capacity)
             continue
         m = _METRIC_LINE.match(line)
         if not m:
@@ -146,6 +159,19 @@ def parse_load_metrics(text: str) -> dict[str, float]:
     return out
 
 
+def label_metric_source(line: str, rank: int) -> str:
+    sample = _METRIC_SAMPLE.match(line)
+    if sample is None:
+        return line
+    name, raw_labels, value = sample.groups()
+    labels = list(_METRIC_LABEL.finditer(raw_labels or ""))
+    if any(label[1] == "engine" for label in labels):
+        return line
+    tagged = [label[0] for label in labels if label[1] != "dsv41_rank"]
+    tagged.append(f'dsv41_rank="{rank}"')
+    return f"{name}{{{','.join(tagged)}}}{value}"
+
+
 @dataclass
 class Rank:
     index: int
@@ -158,11 +184,13 @@ class Rank:
     # Scraped from the rank's /metrics (None until the first successful scrape).
     kv_usage: float | None = None
     waiting: int | None = None
+    kv_cache_size_tokens: float | None = None
     load_ts: float = 0.0
     # Insertion-ordered set of live prefix digests (dict preserves order).
     digests: dict[bytes, None] = field(default_factory=dict)
     digest_counts: dict[bytes, int] = field(default_factory=dict)
-    hash_to_digest: dict[str, bytes] = field(default_factory=dict)
+    # (cache group, external block hash) -> (digest, live block references).
+    block_refs: dict[tuple[int | None, bytes | int], tuple[bytes, int]] = field(default_factory=dict)
     evicted: int = 0   # digests dropped by the MAX_DIGESTS safety bound
     resets: int = 0    # AllBlocksCleared events (vLLM reset its prefix cache)
 
@@ -177,10 +205,10 @@ class Rank:
         if len(self.digests) > MAX_DIGESTS:
             self._evict_oldest()
 
-    def remove_digest(self, digest: bytes) -> None:
-        count = self.digest_counts.get(digest, 0) - 1
-        if count > 0:
-            self.digest_counts[digest] = count
+    def remove_digest(self, digest: bytes, count: int = 1) -> None:
+        remaining = self.digest_counts.get(digest, 0) - count
+        if remaining > 0:
+            self.digest_counts[digest] = remaining
             return
         self.digest_counts.pop(digest, None)
         self.digests.pop(digest, None)
@@ -190,18 +218,33 @@ class Rank:
         for digest in list(itertools.islice(self.digests, n)):
             del self.digests[digest]
             self.digest_counts.pop(digest, None)
+        self.prune_block_refs()
         self.evicted += n
         logger.warning("rank %d: digest table over %d live entries, evicted %d oldest "
                        "(leaked BlockRemoved events?)", self.index, MAX_DIGESTS, n)
 
-    def prune_hash_map(self) -> None:
-        """Drop hash -> digest entries whose digest is no longer tracked."""
-        self.hash_to_digest = {h: d for h, d in self.hash_to_digest.items() if d in self.digests}
+    def prune_block_refs(self) -> None:
+        self.block_refs = {
+            key: entry for key, entry in self.block_refs.items() if entry[0] in self.digests
+        }
+
+    def trim_block_refs(self) -> None:
+        # Many groups or distinct hashes can refer to the same token digest.
+        # Bound that table separately, even if the digest limit was never hit.
+        limit = MAX_DIGESTS * 2
+        if len(self.block_refs) <= limit:
+            return
+        n = max(1, int(limit * EVICT_FRACTION))
+        for key in list(itertools.islice(self.block_refs, n)):
+            digest, count = self.block_refs.pop(key)
+            self.remove_digest(digest, count)
+        logger.warning("rank %d: block reference table over %d entries, evicted %d oldest",
+                       self.index, limit, n)
 
     def clear(self) -> None:
         self.digests.clear()
         self.digest_counts.clear()
-        self.hash_to_digest.clear()
+        self.block_refs.clear()
 
     def reset(self) -> None:
         """vLLM cleared its whole prefix cache (AllBlocksCleared)."""
@@ -216,9 +259,12 @@ class Rank:
             matched += 1
         return matched
 
+    def load_is_fresh(self, now: float) -> bool:
+        return self.load_ts > 0 and now - self.load_ts <= LOAD_STALE_S
+
     def saturated(self, kv_high: float, now: float) -> bool:
         """Scraped load says new work would queue here (fresh data only)."""
-        if not self.load_ts or now - self.load_ts > LOAD_STALE_S:
+        if not self.load_is_fresh(now):
             return False
         if self.waiting is not None and self.waiting > 0:
             return True
@@ -356,24 +402,31 @@ class Router:
             socket.close(linger=0)
 
     def _handle_event(self, rank: Rank, event: Any) -> None:
-        if isinstance(event, dict):
-            kind = event.get("type")
-        else:
+        if not isinstance(event, dict):
             return
+        medium = event.get("medium")
+        if medium is not None and str(medium).upper() not in ("GPU", "NPU"):
+            return
+        if str(event.get("locality")).upper() == "REMOTE":
+            return
+
+        kind = event.get("type")
+        group = event.get("group_idx")
         if kind == "AllBlocksCleared":
             rank.reset()
             return
         if kind == "BlockRemoved":
             for block_hash in event.get("block_hashes") or []:
-                digest = rank.hash_to_digest.get(block_hash)
-                if digest is None:
+                key = (group, block_hash)
+                entry = rank.block_refs.get(key)
+                if entry is None:
                     continue
+                digest, count = entry
+                if count == 1:
+                    del rank.block_refs[key]
+                else:
+                    rank.block_refs[key] = (digest, count - 1)
                 rank.remove_digest(digest)
-                # Keep the hash -> digest mapping until every cache group has
-                # removed it; otherwise the remaining group events cannot
-                # decrement the reference count.
-                if rank.digest_counts.get(digest, 0) <= 0:
-                    rank.hash_to_digest.pop(block_hash, None)
             return
         if kind != "BlockStored":
             return
@@ -382,9 +435,14 @@ class Router:
         tokens = event.get("token_ids") or []
         block_size = int(event.get("block_size") or self.block_size)
         parent = event.get("parent_block_hash")
-        previous = rank.hash_to_digest.get(parent, b"") if parent else b""
         if not hashes:
             return
+        previous = b""
+        if parent is not None:
+            entry = rank.block_refs.get((group, parent))
+            if entry is None:
+                return
+            previous = entry[0]
         chunks = [tokens[i:i + block_size] for i in range(0, len(tokens), block_size)]
         # Null/masked blocks can make lengths differ; pair what we can safely.
         pair_count = min(len(hashes), len(chunks))
@@ -392,11 +450,13 @@ class Router:
             if len(chunk) != block_size:
                 break
             previous = block_digest(previous, chunk)
-            rank.hash_to_digest[block_hash] = previous
+            key = (group, block_hash)
+            digest, count = rank.block_refs.get(key, (previous, 0))
+            if digest != previous:
+                break
+            rank.block_refs[key] = (previous, count + 1)
             rank.add_digest(previous)
-        # Bound the hash table as well as the digest set.
-        if len(rank.hash_to_digest) > MAX_DIGESTS * 2:
-            rank.prune_hash_map()
+        rank.trim_block_refs()
 
     # ---- health / load ---------------------------------------------------
     async def _health_loop(self) -> None:
@@ -438,6 +498,7 @@ class Router:
             return
         rank.kv_usage = load.get("kv_usage")
         rank.waiting = int(load["waiting"]) if "waiting" in load else None
+        rank.kv_cache_size_tokens = load.get("kv_cache_size_tokens")
         rank.load_ts = time.monotonic()
 
     # ---- tokenization / routing -----------------------------------------
@@ -537,6 +598,19 @@ class Router:
             return (s, rank.active, rank.index)
 
         choice = min(candidates, key=lambda r: score(r, True))
+        if (prompt_tokens > 0 and choice.load_is_fresh(now)
+                and choice.kv_usage is not None and choice.kv_usage >= self.kv_high):
+            # Charge the full input. Prefix affinity is only an estimate and
+            # even reusable blocks need to stay resident during execution.
+            alternatives = (
+                rank for rank in candidates
+                if rank is not choice and rank.healthy and rank.load_is_fresh(now)
+                and rank.waiting == 0 and rank.kv_usage is not None
+                and 0 <= rank.kv_usage < min(0.80, self.kv_high)
+                and rank.kv_cache_size_tokens is not None
+                and prompt_tokens <= (1 - rank.kv_usage) * rank.kv_cache_size_tokens
+            )
+            choice = min(alternatives, key=lambda r: score(r, True), default=choice)
         if choice is not min(candidates, key=lambda r: score(r, False)):
             self.stats["sat_avoid"] += 1
         if best > 0:
@@ -700,7 +774,8 @@ class Router:
                        "cached_prefix_digests": len(r.digests),
                        "inflight_tokens": r.inflight_tokens,
                        "pending_prefill": r.pending_prefill,
-                       "kv_usage": r.kv_usage, "waiting": r.waiting} for r in self.ranks],
+                       "kv_usage": r.kv_usage, "waiting": r.waiting,
+                       "kv_cache_size_tokens": r.kv_cache_size_tokens} for r in self.ranks],
             "digest_evicted": sum(r.evicted for r in self.ranks),
             "digest_resets": sum(r.resets for r in self.ranks),
             **self.stats,
@@ -708,26 +783,26 @@ class Router:
 
     async def _aggregate_metrics(self) -> web.Response:
         assert self.session is not None
-        texts: list[str] = []
+        texts: list[tuple[int, str]] = []
         for rank in self.ranks:
             try:
                 async with self.session.get(rank.url + "/metrics",
                                             timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
-                        texts.append(await resp.text())
+                        texts.append((rank.index, await resp.text()))
             except Exception:  # noqa: BLE001
                 pass
         if not texts:
             return web.Response(status=503, text="metrics unavailable")
         seen_meta: set[str] = set()
         lines: list[str] = []
-        for text in texts:
+        for rank, text in texts:
             for line in text.splitlines():
                 if line.startswith("# HELP") or line.startswith("# TYPE"):
                     if line in seen_meta:
                         continue
                     seen_meta.add(line)
-                lines.append(line)
+                lines.append(label_metric_source(line, rank))
         return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
 

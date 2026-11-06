@@ -117,8 +117,10 @@ digest_i = BLAKE2b(digest_{i-1} || tokens[i*128:(i+1)*128])
 3. 对每个 rank 求“从第一个 block 开始连续命中的最长长度”；
 4. 按 3.2 的策略在各 rank 之间打分选择。
 
-同一 block 会被 12 个 KV cache group 各发一次事件；router 用引用计数去重，
-`BlockRemoved` 逐次递减，避免某个 group 移除就让整段前缀“消失”。
+同一 block 可能由多个 KV cache group 发布。router 按 `(group_idx, block_hash)`
+记引用，`BlockRemoved` 只递减对应组的引用。索引只接受本地 GPU/NPU 事件和省略
+`medium` 的旧事件，CPU、DRAM 和远端事件不参与本地亲和估算。父块未知时跳过该段，
+避免把前缀中间的块当作起点。
 
 ### 3.2 打分策略（`DSV41_ROUTER_POLICY=cost`，默认）
 
@@ -135,8 +137,10 @@ score(rank) = 该 rank 上未命中的 prompt token
   不依赖抓取延迟）；
 - 饱和判断来自每 `LOAD_INTERVAL` 秒抓取的 rank `/metrics`
   （`vllm:kv_cache_usage_perc`、`vllm:num_requests_waiting`）；数据超过 10 s 视为过期并忽略；
-- 命中很长的请求（命中 token > `SAT_PENALTY`）即使目标 rank 已饱和也留在原 rank，
-  命中很短的请求则会被分流，避免继续堆在已经排队的 rank 上。
+- 当评分最低的 rank 的新鲜 KV 占用达到 `KV_HIGH` 时，优先选有明确余量的健康 rank。
+  该 rank 的新鲜占用必须低于 80% 和 `KV_HIGH`，等待数为零，且按
+  `vllm:cache_config_info` 的 `kv_cache_size_tokens` 估算，空余 KV 能容纳完整输入。
+  无法确认余量时使用原评分，长前缀的亲和收益仍可抵消软罚分。
 
 三个参数都是经验值（默认 `KV_HIGH=0.90`、`SAT_PENALTY=32768`、`PREFILL_WEIGHT=0.5`），
 需要用自己的负载调；改完 `ROUTER_RESTART=1 bash scripts/serve.sh` 即可生效。
@@ -148,7 +152,7 @@ score(rank) = 该 rank 上未命中的 prompt token
 只差 1–2 个，所以按请求数的旧策略看不到这个失衡，rank0 因 KV 抖动命中率从 84% 掉到 58%。
 
 `/router/stats` 的 `spills` 是“没有选中命中最长的 rank”的次数，`sat_avoid` 是“因为饱和罚分
-改变了选择”的次数，`fallback` 是完全没有命中的请求数。
+或高水位避让改变了选择”的次数，`fallback` 是完全没有命中的请求数。
 
 **legacy 策略**（`DSV41_ROUTER_POLICY=legacy`，回退用）：命中最长者优先；并列取 active 少者；
 没有命中时先查 `sticky` 表（`prompt body hash → rank`，最多 50k 条，LRU），再取 active 最少者；
@@ -210,17 +214,23 @@ curl --noproxy '*' http://127.0.0.1:8021/router/stats \
 - `cached_prefix_digests`：该 rank 当前可匹配的前缀块数；
 - `inflight_tokens`：正在该 rank 上的请求的 prompt token 之和（KV 占用的近似）；
 - `pending_prefill`：已派发但尚未出首个响应字节的未命中 prompt token（prefill 排队量）；
-- `kv_usage` / `waiting`：最近一次抓到的 `/metrics`（`null` = 还没抓到或指标名不符）；
+- `kv_usage` / `waiting` / `kv_cache_size_tokens`：最近一次抓到的占用率、等待请求数和
+  KV token 容量（`null` 表示尚未收到该值）；
 - `affinity_hits`：选中了命中最长的 rank 的请求数；
 - `spills`：有命中、但因负载打分选了别的 rank 的请求数；
-- `sat_avoid`：因饱和罚分而改变了选择的请求数；
+- `sat_avoid`：因饱和罚分或高水位避让而改变了选择的请求数；
 - `fallback`：完全没有命中的请求数（legacy 下还包括 skew 切换）；
 - `digest_evicted` / `digest_resets`：digest 表被安全上限淘汰的条数 / vLLM 清空前缀缓存的次数；
 - `events`：消费的 KV 事件条数。
 
-`GET /metrics` 会把两个 rank 的 Prometheus 文本合并（去重 HELP/TYPE），
-因此 `prefix_cache_hits_total`、`num_requests_running` 等仍可直接抓取。
-单 rank 指标也可直接访问 `:8022/metrics`、`:8023/metrics`。
+`GET /metrics` 合并两个 rank 的 Prometheus 文本并去重 HELP/TYPE。已有 `engine`
+标签的样本保持原样。HTTP、进程、Python 和 tool parser 等无 `engine` 标签的样本
+带来源标签 `dsv41_rank="0"` 或 `dsv41_rank="1"`。查询时按 `dsv41_rank` 区分来源，
+跨 rank 汇总时按指标语义聚合，例如先对计数器求速率再求和。单侧抓取失败时仍返回
+另一侧，两侧都失败时返回 503。也可直接抓取 `:8022/metrics` 和 `:8023/metrics`。
+
+发布路由代码前先摘流并排空请求，然后运行 `make router-restart`。回滚时恢复上一版
+路由文件并通过同一入口重启。路由重启后由新 KV 事件重新建立本地亲和索引。
 
 ## 5. 故障与回滚
 

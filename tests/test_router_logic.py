@@ -132,12 +132,12 @@ class RankTest(unittest.TestCase):
         self.assertEqual(len(rank.digests), 0)
         self.assertEqual(rank.resets, 1)
 
-    def test_prune_hash_map_drops_dead_entries(self) -> None:
+    def test_prune_block_refs_drops_dead_entries(self) -> None:
         rank = prefix_router.Rank(0, "http://127.0.0.1:1")
         rank.add_digest(b"keep")
-        rank.hash_to_digest = {"h1": b"keep", "h2": b"gone"}
-        rank.prune_hash_map()
-        self.assertEqual(rank.hash_to_digest, {"h1": b"keep"})
+        rank.block_refs = {(0, b"h1"): (b"keep", 1), (1, b"h2"): (b"gone", 1)}
+        rank.prune_block_refs()
+        self.assertEqual(rank.block_refs, {(0, b"h1"): (b"keep", 1)})
 
     def test_saturated_needs_fresh_data(self) -> None:
         rank = prefix_router.Rank(0, "http://127.0.0.1:1")
@@ -226,9 +226,29 @@ class CostPolicyTest(unittest.TestCase):
         self.assertEqual(self.router.stats["fallback"], 1)
 
     def test_strong_match_survives_saturation(self) -> None:
+        # With only a hot-rank scrape, the old soft penalty still applies.
         self.saturate(0)
         matched = [600, 0]          # 76,800 of 80,000 tokens cached on rank 0
         self.assertEqual(self.router._choose_rank(b"k", matched, self.PROMPT), 0)
+
+    def test_high_watermark_uses_confirmed_headroom(self) -> None:
+        self.saturate(0, waiting=0, kv=0.96)
+        self.saturate(1, waiting=0, kv=0.50)
+        self.router.ranks[1].kv_cache_size_tokens = 1_000_000
+        self.assertEqual(self.router._choose_rank(b"k", [600, 0], self.PROMPT), 1)
+        self.assertEqual(self.router.stats["sat_avoid"], 1)
+
+    def test_high_watermark_falls_back_without_confirmed_headroom(self) -> None:
+        for attrs in ({"kv_cache_size_tokens": 100_000}, {"load_ts": self.now - 11},
+                      {"waiting": None}, {"waiting": 1}, {"kv_usage": 0.80}):
+            with self.subTest(**attrs):
+                self.saturate(0, kv=0.96)
+                self.saturate(1, waiting=0, kv=0.50)
+                rank = self.router.ranks[1]
+                rank.kv_cache_size_tokens = 1_000_000
+                for name, value in attrs.items():
+                    setattr(rank, name, value)
+                self.assertEqual(self.router._choose_rank(b"k", [600, 0], self.PROMPT), 0)
 
     def test_weak_match_loses_to_saturation(self) -> None:
         self.saturate(0)
@@ -358,6 +378,46 @@ class KvEventTest(unittest.TestCase):
     def feed(self, router, rank_idx, events) -> None:
         for ev in wire(events):
             router._handle_event(router.ranks[rank_idx], ev)
+
+    def test_external_events_do_not_affect_local_affinity(self) -> None:
+        router = make_router()
+        tokens = toks(1, 1)
+        hashes = chain_hashes(tokens, self.BS)
+        probe = prefix_router.prefix_digests(tokens)
+        self.feed(router, 0, [BlockStored(hashes, None, tokens, self.BS, medium="cpu")])
+        self.assertEqual(router.ranks[0].matched_blocks(probe), 0)
+        self.feed(router, 0, [
+            BlockStored(hashes, None, tokens, self.BS, medium="GPU", group_idx=0),
+            BlockRemoved(hashes, medium="CPU", group_idx=0),
+        ])
+        self.assertEqual(router.ranks[0].matched_blocks(probe), 1)
+        self.feed(router, 0, [BlockRemoved(hashes, medium="GPU", group_idx=0)])
+        self.assertEqual(router.ranks[0].matched_blocks(probe), 0)
+
+    def test_group_removal_consumes_only_its_own_references(self) -> None:
+        router = make_router()
+        tokens = toks(1, 1)
+        hashes = chain_hashes(tokens, self.BS)
+        probe = prefix_router.prefix_digests(tokens)
+        self.feed(router, 0, [
+            BlockStored(hashes, None, tokens, self.BS, group_idx=0),
+            BlockStored(hashes, None, tokens, self.BS, group_idx=0),
+            BlockStored(hashes, None, tokens, self.BS, group_idx=1),
+        ])
+        for group in (0, 0, 0):
+            self.feed(router, 0, [BlockRemoved(hashes, group_idx=group)])
+            self.assertEqual(router.ranks[0].matched_blocks(probe), 1)
+        self.feed(router, 0, [BlockRemoved(hashes, group_idx=1)])
+        self.assertEqual(router.ranks[0].matched_blocks(probe), 0)
+
+    def test_missing_parent_does_not_turn_a_middle_block_into_a_prefix(self) -> None:
+        router = make_router()
+        tokens = toks(1, 2)
+        hashes = chain_hashes(tokens, self.BS)
+        self.feed(router, 0, [BlockStored(hashes[1:], hashes[0], tokens[self.BS:],
+                                          self.BS, group_idx=0)])
+        probe = prefix_router.prefix_digests(tokens[self.BS:])
+        self.assertEqual(router.ranks[0].matched_blocks(probe), 0)
 
     def test_wire_format_is_tagged_dict_and_matches(self) -> None:
         router = make_router()

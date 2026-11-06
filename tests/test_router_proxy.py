@@ -33,6 +33,9 @@ class FakeRank:
         self.tokens = tokens
         self.waiting = waiting
         self.kv = kv
+        self.index = 0
+        self.extra_metrics = ""
+        self.metrics_status = 200
         self.completions = 0
         self.first_token_delay = 0.0
         self.close_next = 0          # drop the connection before answering, N times
@@ -60,9 +63,13 @@ class FakeRank:
         return web.Response(text="ok")
 
     async def _metrics(self, request):
-        text = ('vllm:num_requests_waiting{engine="0"} %s\n'
-                'vllm:kv_cache_usage_perc{engine="0"} %s\n' % (float(self.waiting), self.kv))
-        return web.Response(text=text, content_type="text/plain")
+        text = (
+            f'vllm:num_requests_waiting{{engine="{self.index}"}} {float(self.waiting)}\n'
+            f'vllm:kv_cache_usage_perc{{engine="{self.index}"}} {self.kv}\n'
+            f'vllm:cache_config_info{{engine="{self.index}",kv_cache_size_tokens="1000000"}} 1\n'
+        )
+        return web.Response(text=text + self.extra_metrics, status=self.metrics_status,
+                            content_type="text/plain")
 
     async def _tokenize(self, request):
         return web.json_response({"tokens": list(range(self.tokens)), "count": self.tokens})
@@ -98,7 +105,8 @@ class Harness:
         self.base = ""
 
     async def __aenter__(self) -> "Harness":
-        for r in self.ranks:
+        for index, r in enumerate(self.ranks):
+            r.index = index
             await r.start()
         args = SimpleNamespace(
             upstream=[r.url for r in self.ranks], kv_events=[], block_size=128, max_skew=8,
@@ -138,6 +146,52 @@ BODY = {"model": "m", "prompt": "hello", "max_tokens": 8, "stream": True}
 
 
 class ProxyTest(unittest.TestCase):
+    def test_metrics_distinguishes_unlabelled_series_by_source(self) -> None:
+        async def go() -> None:
+            a, b = FakeRank(), FakeRank()
+            a.extra_metrics = b.extra_metrics = (
+                '# HELP http_request_duration_seconds Request duration.\n'
+                '# TYPE http_request_duration_seconds histogram\n'
+                'http_request_duration_seconds_bucket{handler="/tokenize",le="0.5"} 3\n'
+                'http_request_duration_seconds_sum{handler="/tokenize"} 1.1\n'
+                'http_request_duration_seconds_count{handler="/tokenize"} 3\n'
+                'process_cpu_seconds_total 21\n'
+                'python_gc_objects_collected_total{generation="0"} 5\n'
+                'vllm:tool_call_parser_invocations_total{mode="streaming"} 10\n'
+                'http_requests_total{handler="/path/},engine=\\"fake\\""} 7 1234\n'
+            )
+            async with Harness([a, b]) as h:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(h.base + "/metrics") as resp:
+                        self.assertEqual(resp.status, 200)
+                        lines = (await resp.text()).splitlines()
+                    self.assertEqual(lines.count('# TYPE http_request_duration_seconds histogram'), 1)
+                    self.assertEqual(lines.count('# HELP http_request_duration_seconds Request duration.'), 1)
+                    self.assertEqual(len([line for line in lines if line.startswith('process_cpu_seconds_total')]), 2)
+                    for rank in ("0", "1"):
+                        label = f'dsv41_rank="{rank}"'
+                        for sample in (
+                            f'http_request_duration_seconds_bucket{{handler="/tokenize",le="0.5",{label}}} 3',
+                            f'http_request_duration_seconds_sum{{handler="/tokenize",{label}}} 1.1',
+                            f'http_request_duration_seconds_count{{handler="/tokenize",{label}}} 3',
+                            f'process_cpu_seconds_total{{{label}}} 21',
+                            f'python_gc_objects_collected_total{{generation="0",{label}}} 5',
+                            f'vllm:tool_call_parser_invocations_total{{mode="streaming",{label}}} 10',
+                            f'vllm:kv_cache_usage_perc{{engine="{rank}"}} 0.2',
+                            f'http_requests_total{{handler="/path/}},engine=\\"fake\\"",{label}}} 7 1234',
+                        ):
+                            self.assertEqual(lines.count(sample), 1, sample)
+                    a.metrics_status = 503
+                    async with s.get(h.base + "/metrics") as resp:
+                        self.assertEqual(resp.status, 200)
+                        body = await resp.text()
+                        self.assertIn('process_cpu_seconds_total{dsv41_rank="1"} 21', body)
+                        self.assertNotIn('dsv41_rank="0"', body)
+                    b.metrics_status = 503
+                    async with s.get(h.base + "/metrics") as resp:
+                        self.assertEqual(resp.status, 503)
+        run(go())
+
     def test_load_is_booked_until_first_byte_then_released(self) -> None:
         async def go() -> None:
             a, b = FakeRank(tokens=1000), FakeRank(tokens=1000)
@@ -172,6 +226,25 @@ class ProxyTest(unittest.TestCase):
                 self.assertEqual(st["ranks"][0]["waiting"], 3)
                 self.assertAlmostEqual(st["ranks"][0]["kv_usage"], 0.95)
                 self.assertEqual(st["policy"], "cost")
+        run(go())
+
+    def test_routes_hot_prefix_to_rank_with_scraped_kv_headroom(self) -> None:
+        async def go() -> None:
+            a = FakeRank(tokens=80_000, waiting=2, kv=0.96)
+            b = FakeRank(tokens=80_000, waiting=0, kv=0.40)
+            async with Harness([a, b]) as h:
+                h.router._handle_event(h.router.ranks[0], {
+                    "type": "BlockStored", "block_hashes": list(range(600)),
+                    "token_ids": list(range(600 * 128)), "block_size": 128,
+                    "group_idx": 0, "medium": "GPU",
+                })
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(h.base + "/v1/completions", json=BODY) as resp:
+                        self.assertEqual(resp.status, 200)
+                        await resp.read()
+                self.assertEqual((a.completions, b.completions), (0, 1))
+                stats = await h.stats()
+                self.assertEqual((stats["spills"], stats["sat_avoid"]), (1, 1))
         run(go())
 
     def test_stale_keepalive_is_retried_on_the_same_rank(self) -> None:
