@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 try:
     import aiohttp
+    import msgspec
+    import zmq.asyncio
     from aiohttp import web
     import prefix_router
 except ImportError as exc:  # pragma: no cover - optional host dependencies
@@ -146,6 +148,54 @@ BODY = {"model": "m", "prompt": "hello", "max_tokens": 8, "stream": True}
 
 
 class ProxyTest(unittest.TestCase):
+    def test_dp4_routes_by_kv_events_and_fails_over(self) -> None:
+        async def go() -> None:
+            ranks = [FakeRank(tokens=512) for _ in range(4)]
+            publishers = []
+            endpoints = []
+            try:
+                for _ in ranks:
+                    publisher = zmq.asyncio.Context.instance().socket(zmq.XPUB)
+                    publishers.append(publisher)
+                    port = publisher.bind_to_random_port("tcp://127.0.0.1")
+                    endpoints.append(f"tcp://127.0.0.1:{port}")
+                async with Harness(ranks, kv_events=endpoints) as h:
+                    for index, publisher in enumerate(publishers):
+                        # Wait for the subscription before sending any cache events.
+                        self.assertEqual(await asyncio.wait_for(publisher.recv(), 5), b"\x01")
+                        blocks = index + 1
+                        event = {
+                            "type": "BlockStored", "block_hashes": list(range(blocks)),
+                            "token_ids": list(range(blocks * 128)), "block_size": 128,
+                            "group_idx": 0, "medium": "NPU",
+                        }
+                        await publisher.send_multipart([
+                            b"kv-events", b"\x00" * 8,
+                            msgspec.msgpack.encode([0.0, [event], index]),
+                        ])
+                    for _ in range(100):
+                        stats = await h.stats()
+                        if stats["events"] == 4:
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertEqual([r["cached_prefix_digests"] for r in stats["ranks"]], [1, 2, 3, 4])
+
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(h.base + "/v1/completions", json=BODY) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertIn(b"data: [DONE]", await response.read())
+                        self.assertEqual([r.completions for r in ranks], [0, 0, 0, 1])
+
+                        ranks[3].close_next = 2
+                        async with session.post(h.base + "/v1/completions", json=BODY) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertIn(b"data: [DONE]", await response.read())
+                        self.assertEqual([r.completions for r in ranks], [1, 0, 0, 3])
+            finally:
+                for publisher in publishers:
+                    publisher.close(linger=0)
+        run(go())
+
     def test_metrics_distinguishes_unlabelled_series_by_source(self) -> None:
         async def go() -> None:
             a, b = FakeRank(), FakeRank()

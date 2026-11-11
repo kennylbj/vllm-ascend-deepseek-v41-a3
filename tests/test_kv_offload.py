@@ -144,7 +144,7 @@ elif args[0] == "rm":
         self.stub("python3.12", f"""#!/bin/bash
 if [[ "$1" == -m ]]; then
   printf '%s\n' "$@" > "$MOCK_DIR/serve.args"
-  printf '%s\n' "$PYTHONHASHSEED" "$MMC_LOCAL_CONFIG_PATH" "$LD_LIBRARY_PATH" > "$MOCK_DIR/serve.env"
+  printf '%s\n' "$PYTHONHASHSEED" "$MMC_LOCAL_CONFIG_PATH" "$LD_LIBRARY_PATH" "$HCCL_BUFFSIZE" > "$MOCK_DIR/serve.env"
   touch "$MOCK_DIR/serve.done"
   exit 0
 fi
@@ -165,7 +165,8 @@ exec {shlex.quote(sys.executable)} "$@"
         scheduler.write_text("class KVPoolScheduler:\n    def _process_new_request(self, request): pass\n")
 
         env = dict(self.env, DSV41_IN_CONTAINER="1", DSV41_ALLOW_MULTI="1",
-                   DSV41_ROOTFS="/", DSV41_PYTHONHOME=str(self.base), DSV41_CANN_HOME=str(cann))
+                   DSV41_ROOTFS="/", DSV41_PYTHONHOME=str(self.base), DSV41_CANN_HOME=str(cann),
+                   DSV41_HCCL_BUFFSIZE="768", HCCL_BUFFSIZE="200")
         command = ["bash", str(ROOT / "scripts/serve.sh")]
         result = run(command, env)
         self.assertNotEqual(result.returncode, 0)
@@ -189,7 +190,8 @@ exec {shlex.quote(sys.executable)} "$@"
             },
         })
         self.assertIn("--enable-prefix-caching", args)
-        seed, config_path, ld_path = (self.base / "serve.env").read_text().splitlines()
+        seed, config_path, ld_path, hccl_buffsize = (self.base / "serve.env").read_text().splitlines()
         self.assertEqual(seed, "0")
         self.assertEqual(config_path, str(self.conf / "mmc-local.conf"))
         self.assertIn(str(cann / "lib64"), ld_path.split(":"))
+        self.assertEqual(hccl_buffsize, "768")
